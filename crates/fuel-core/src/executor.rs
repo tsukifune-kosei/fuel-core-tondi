@@ -73,7 +73,7 @@ mod tests {
             op,
         },
         fuel_crypto::SecretKey,
-        fuel_merkle::common::empty_sum_sha256,
+        fuel_merkle::common::empty_sum_blake3,
         fuel_tx::{
             Bytes32,
             ConsensusParameters,
@@ -1874,7 +1874,7 @@ mod tests {
 
         // Input balances: 0 of asset_id [2; 32]
         let mut hasher = blake3::Hasher::new();
-        hasher.update(asset_id);
+        hasher.update(asset_id.as_ref());
         hasher.update(&[0u8]);
         let expected_balance_root: [u8; 32] = *hasher.finalize().as_bytes();
         assert_eq!(
@@ -1884,7 +1884,7 @@ mod tests {
 
         // Output balances: 100 of asset_id [2; 32]
         let mut hasher = blake3::Hasher::new();
-        hasher.update(asset_id);
+        hasher.update(asset_id.as_ref());
         hasher.update(&[1u8]);
         hasher.update(&100u64.to_be_bytes()); // balance
         let expected_balance_root: [u8; 32] = *hasher.finalize().as_bytes();
@@ -1895,7 +1895,7 @@ mod tests {
 
         // Input state: empty slot tx_id
         let mut hasher = blake3::Hasher::new();
-        hasher.update(tx_id); // the slot key that is modified
+        hasher.update(tx_id.as_ref()); // the slot key that is modified
         hasher.update(&[0u8]); // the slot did not contain any value
         let expected_state_root: [u8; 32] = *hasher.finalize().as_bytes();
         assert_eq!(
@@ -1905,14 +1905,12 @@ mod tests {
 
         // Output state: slot tx_id with value 1
         let mut hasher = blake3::Hasher::new();
-        hasher.update(tx_id); // the slot key that is modified
+        hasher.update(tx_id.as_ref()); // the slot key that is modified
         hasher.update(&[1u8]); // the slot contains a value
         hasher.update(&32u64.to_be_bytes()); // slot size is 32 bytes
-        hasher.update({
-            let mut value = [0u8; 32];
-            value[..8].copy_from_slice(&1u64.to_be_bytes()); // the value is 1
-            value
-        }); // The value in the slot is 1
+        let mut value = [0u8; 32];
+        value[..8].copy_from_slice(&1u64.to_be_bytes()); // the value is 1
+        hasher.update(&value); // The value in the slot is 1
         let expected_state_root: [u8; 32] = *hasher.finalize().as_bytes();
         assert_eq!(
             executed_tx.outputs()[0].state_root(),
@@ -2016,7 +2014,7 @@ mod tests {
 
         // Input balances: 0 of asset_id [2; 32]
         let mut hasher = blake3::Hasher::new();
-        hasher.update(asset_id);
+        hasher.update(asset_id.as_ref());
         hasher.update(&[0u8]);
         let expected_balance_root: [u8; 32] = *hasher.finalize().as_bytes();
         assert_eq!(
@@ -2032,7 +2030,7 @@ mod tests {
 
         // Input state: empty slot tx_id
         let mut hasher = blake3::Hasher::new();
-        hasher.update(tx_id); // the slot key that is modified
+        hasher.update(tx_id.as_ref()); // the slot key that is modified
         hasher.update(&[0u8]); // the slot did not contain any value
         let expected_state_root: [u8; 32] = *hasher.finalize().as_bytes();
         assert_eq!(
@@ -2144,7 +2142,7 @@ mod tests {
 
         // Input balances: 0 of asset_id [2; 32]
         let mut hasher = blake3::Hasher::new();
-        hasher.update(asset_id);
+        hasher.update(asset_id.as_ref());
         hasher.update(&[0u8]);
         let expected_balance_root: [u8; 32] = *hasher.finalize().as_bytes();
         assert_eq!(
@@ -2154,7 +2152,7 @@ mod tests {
 
         // Output balances: 100 of asset_id [2; 32]
         let mut hasher = blake3::Hasher::new();
-        hasher.update(asset_id);
+        hasher.update(asset_id.as_ref());
         hasher.update(&[1u8]);
         hasher.update(&100u64.to_be_bytes()); // balance
         let expected_balance_root: [u8; 32] = *hasher.finalize().as_bytes();
@@ -2165,7 +2163,7 @@ mod tests {
 
         // Input state: empty slot tx_id
         let mut hasher = blake3::Hasher::new();
-        hasher.update(tx_id); // the slot key that is modified
+        hasher.update(tx_id.as_ref()); // the slot key that is modified
         hasher.update(&[0u8]); // the slot did not contain any value
         let expected_state_root: [u8; 32] = *hasher.finalize().as_bytes();
         assert_eq!(
@@ -2175,14 +2173,12 @@ mod tests {
 
         // Output state: slot tx_id with value 2
         let mut hasher = blake3::Hasher::new();
-        hasher.update(tx_id); // the slot key that is modified
+        hasher.update(tx_id.as_ref()); // the slot key that is modified
         hasher.update(&[1u8]); // the slot has a value
         hasher.update(&32u64.to_be_bytes()); // slot size is 32 bytes
-        hasher.update({
-            let mut value = [0u8; 32];
-            value[..8].copy_from_slice(&2u64.to_be_bytes()); // the value is 2
-            value
-        }); // The value in the slot is 1
+        let mut value = [0u8; 32];
+        value[..8].copy_from_slice(&2u64.to_be_bytes()); // the value is 2
+        hasher.update(&value); // The value in the slot is 1
         let expected_state_root: [u8; 32] = *hasher.finalize().as_bytes();
         assert_eq!(
             executed_tx.outputs()[0].state_root(),
@@ -2329,7 +2325,7 @@ mod tests {
         for i in 0..4u64 {
             let mut slot_id = [0u8; 32];
             slot_id[..8].copy_from_slice(&i.to_be_bytes());
-            hasher.update(slot_id); // the slot key that is modified
+            hasher.update(&slot_id); // the slot key that is modified
             hasher.update(&[0u8]); // the slot did not contain any value
         }
         let expected_state_root: [u8; 32] = *hasher.finalize().as_bytes();
@@ -2343,10 +2339,10 @@ mod tests {
         for i in 0..4u64 {
             let mut slot_id = [0u8; 32];
             slot_id[..8].copy_from_slice(&i.to_be_bytes());
-            hasher.update(slot_id); // the slot key that is modified
+            hasher.update(&slot_id); // the slot key that is modified
             hasher.update(&[1u8]); // the slot contains a value
             hasher.update(&32u64.to_be_bytes()); // slot size is 32 bytes
-            hasher.update(slot_id); // slot value (matches the id)
+            hasher.update(&slot_id); // slot value (matches the id)
         }
         let expected_state_root: [u8; 32] = *hasher.finalize().as_bytes();
         assert_eq!(
@@ -2509,7 +2505,7 @@ mod tests {
 
         // Input balances: 0 of asset_id [2; 32] for both contracts
         let mut hasher = blake3::Hasher::new();
-        hasher.update(asset_id);
+        hasher.update(asset_id.as_ref());
         hasher.update(&[0u8]);
         let expected_balance_root: [u8; 32] = *hasher.finalize().as_bytes();
         assert_eq!(
@@ -2523,7 +2519,7 @@ mod tests {
 
         // Output balances: 100 of asset_id [2; 32] for both contracts
         let mut hasher = blake3::Hasher::new();
-        hasher.update(asset_id);
+        hasher.update(asset_id.as_ref());
         hasher.update(&[1u8]);
         hasher.update(&100u64.to_be_bytes()); // balance
         let expected_balance_root: [u8; 32] = *hasher.finalize().as_bytes();
@@ -2538,7 +2534,7 @@ mod tests {
 
         // Input state: empty slots for both contracts
         let mut hasher = blake3::Hasher::new();
-        hasher.update(tx_id1); // the slot key matches tx_id
+        hasher.update(tx_id1.as_ref()); // the slot key matches tx_id
         hasher.update(&[0u8]); // the slot did not contain any value
         let expected_state_root: [u8; 32] = *hasher.finalize().as_bytes();
         assert_eq!(
@@ -2552,14 +2548,12 @@ mod tests {
 
         // Output state: the slot tx_id with value 1 for both contracts
         let mut hasher = blake3::Hasher::new();
-        hasher.update(tx_id1); // the slot key matches tx_id
+        hasher.update(tx_id1.as_ref()); // the slot key matches tx_id
         hasher.update(&[1u8]); // the slot contains a value
         hasher.update(&32u64.to_be_bytes()); // slot size is 32 bytes
-        hasher.update({
-            let mut value = [0u8; 32];
-            value[..8].copy_from_slice(&1u64.to_be_bytes()); // the value is 1
-            value
-        });
+        let mut value = [0u8; 32];
+        value[..8].copy_from_slice(&1u64.to_be_bytes()); // the value is 1
+        hasher.update(&value);
         let expected_state_root: [u8; 32] = *hasher.finalize().as_bytes();
         assert_eq!(
             executed_tx.outputs()[0].state_root(),
@@ -2579,7 +2573,7 @@ mod tests {
 
         // Input balance: 100 of asset_id [2; 32]
         let mut hasher = blake3::Hasher::new();
-        hasher.update(asset_id);
+        hasher.update(asset_id.as_ref());
         hasher.update(&[1u8]);
         hasher.update(&100u64.to_be_bytes()); // balance
         let expected_balance_root: [u8; 32] = *hasher.finalize().as_bytes();
@@ -2590,7 +2584,7 @@ mod tests {
 
         // Output balance: 200 of asset_id [2; 32]
         let mut hasher = blake3::Hasher::new();
-        hasher.update(asset_id);
+        hasher.update(asset_id.as_ref());
         hasher.update(&[1u8]);
         hasher.update(&200u64.to_be_bytes()); // balance
         let expected_balance_root: [u8; 32] = *hasher.finalize().as_bytes();
@@ -2601,7 +2595,7 @@ mod tests {
 
         // Input state: one empty slot (from tx 2), the slot from tx 1 is not accessed
         let mut hasher = blake3::Hasher::new();
-        hasher.update(tx_id2); // the slot key matches tx_id
+        hasher.update(tx_id2.as_ref()); // the slot key matches tx_id
         hasher.update(&[0u8]); // the slot contains no value
         let expected_state_root: [u8; 32] = *hasher.finalize().as_bytes();
         assert_eq!(
@@ -2611,14 +2605,12 @@ mod tests {
 
         // Input state: one slot with value 1 (from tx 2), the slot from tx 1 is not accessed
         let mut hasher = blake3::Hasher::new();
-        hasher.update(tx_id2); // the slot key matches tx_id
+        hasher.update(tx_id2.as_ref()); // the slot key matches tx_id
         hasher.update(&[1u8]); // the slot contains a value
         hasher.update(&32u64.to_be_bytes()); // slot size is 32 bytes
-        hasher.update({
-            let mut value = [0u8; 32];
-            value[..8].copy_from_slice(&1u64.to_be_bytes()); // the value is 1
-            value
-        });
+        let mut value = [0u8; 32];
+        value[..8].copy_from_slice(&1u64.to_be_bytes()); // the value is 1
+        hasher.update(&value);
         let expected_state_root: [u8; 32] = *hasher.finalize().as_bytes();
         assert_eq!(
             executed_tx.outputs()[0].state_root(),
@@ -3384,7 +3376,7 @@ mod tests {
             .expect("block validation failed unexpectedly");
 
         // Then
-        let empty_root = empty_sum_sha256();
+        let empty_root = empty_sum_blake3();
         assert_eq!(block.header().message_outbox_root().as_ref(), empty_root)
     }
 
