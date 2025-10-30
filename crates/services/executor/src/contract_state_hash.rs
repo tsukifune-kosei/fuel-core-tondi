@@ -12,10 +12,6 @@ use fuel_core_types::fuel_tx::{
     Bytes32,
     Word,
 };
-use sha2::{
-    Digest,
-    Sha256,
-};
 
 /// Computes a hash of all contract balances that were read or modified.
 /// The hash is not dependent on the order of reads or writes.
@@ -27,17 +23,17 @@ pub fn compute_balances_hash(accessed: &BTreeMap<AssetId, Option<Word>>) -> Byte
         return Bytes32::zeroed();
     }
 
-    let mut hasher = Sha256::new();
+    let mut hasher = blake3::Hasher::new();
     for (key, value) in accessed {
-        hasher.update(key);
+        hasher.update(key.as_ref());
         if let Some(value) = value {
-            hasher.update([1u8]);
-            hasher.update(value.to_be_bytes());
+            hasher.update(&[1u8]);
+            hasher.update(&value.to_be_bytes());
         } else {
-            hasher.update([0u8]);
+            hasher.update(&[0u8]);
         }
     }
-    Bytes32::new(hasher.finalize().into())
+    Bytes32::new(*hasher.finalize().as_bytes())
 }
 
 /// Computes a hash of all contract state slots that were read or modified.
@@ -50,16 +46,16 @@ pub fn compute_state_hash(accessed: &BTreeMap<Bytes32, Option<Vec<u8>>>) -> Byte
         return Bytes32::zeroed();
     }
 
-    let mut hasher = Sha256::new();
+    let mut hasher = blake3::Hasher::new();
     for (key, value) in accessed {
-        hasher.update(key);
+        hasher.update(key.as_ref());
         if let Some(value) = value {
-            hasher.update([1u8]);
-            hasher.update((value.len() as Word).to_be_bytes());
+            hasher.update(&[1u8]);
+            hasher.update(&(value.len() as Word).to_be_bytes());
             hasher.update(value);
         } else {
-            hasher.update([0u8]);
+            hasher.update(&[0u8]);
         }
     }
-    Bytes32::new(hasher.finalize().into())
+    Bytes32::new(*hasher.finalize().as_bytes())
 }

@@ -22,10 +22,6 @@ use libp2p::gossipsub::{
     Topic,
     TopicScoreParams,
 };
-use sha2::{
-    Digest,
-    Sha256,
-};
 use std::{
     ops::DerefMut,
     time::Duration,
@@ -63,7 +59,8 @@ pub const GRAYLIST_THRESHOLD: f64 = -16000.0;
 /// Creates `GossipsubConfigBuilder` with few of the Gossipsub values already defined
 pub fn default_gossipsub_builder() -> gossipsub::ConfigBuilder {
     let gossip_message_id = move |message: &gossipsub::Message| {
-        MessageId::from(&Sha256::digest(&message.data)[..])
+        let hash = blake3::hash(&message.data);
+        MessageId::from(&hash.as_bytes()[..])
     };
 
     let mut builder = gossipsub::ConfigBuilder::default();

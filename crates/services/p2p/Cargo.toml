@@ -51,7 +51,7 @@ postcard = { workspace = true, features = ["use-std"] }
 quick_cache = "0.6.9"
 rand = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-sha2 = { workspace = true, features = ["default"] }
+blake3 = { workspace = true }
 strum = { workspace = true }
 strum_macros = { workspace = true }
 thiserror = "1.0.47"

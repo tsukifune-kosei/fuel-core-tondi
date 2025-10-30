@@ -20,8 +20,8 @@ yamux = "=0.13.5"
 # Neutral deps
 fuel-core = { path = "../../crates/fuel-core", features = ["test-helpers"] }
 fuel-core-trace = { path = "../../crates/trace" }
-fuel-crypto = { version = "0.63.0" }
-fuel-tx = { version = "0.63.0", features = ["random"] }
+fuel-crypto = { git = "https://github.com/tsukifune-kosei/fuel-vm-blake3.git" }
+fuel-tx = { git = "https://github.com/tsukifune-kosei/fuel-vm-blake3.git", features = ["random"] }
 
 # Latest fuel-core
 latest-fuel-core-bin = { path = "../../bin/fuel-core", package = "fuel-core-bin", features = [

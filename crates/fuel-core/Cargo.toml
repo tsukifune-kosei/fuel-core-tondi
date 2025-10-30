@@ -129,7 +129,7 @@ fuel-core-upgradable-executor = { workspace = true, features = [
   "test-helpers",
 ] }
 proptest = { workspace = true }
-sha2 = { workspace = true, features = ["default"] }
+blake3 = { workspace = true }
 test-case = { workspace = true }
 test-strategy = { workspace = true }
 tokio-test = "0.4.4"
