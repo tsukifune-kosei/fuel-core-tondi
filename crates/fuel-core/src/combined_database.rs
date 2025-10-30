@@ -102,7 +102,8 @@ impl CombinedDatabase {
 
         Self::backup_databases(db_dir, temp_backup_dir.path())?;
 
-        std::fs::rename(temp_backup_dir.path(), backup_dir)
+        let temp_path = temp_backup_dir.keep();
+        std::fs::rename(&temp_path, backup_dir)
             .trace_err("Failed to move temporary backup directory")
             .map_err(|e| anyhow::anyhow!(e))?;
 
@@ -145,7 +146,8 @@ impl CombinedDatabase {
 
         Self::restore_database(backup_dir, temp_restore_dir.path())?;
 
-        std::fs::rename(temp_restore_dir.path(), restore_to)
+        let temp_path = temp_restore_dir.keep();
+        std::fs::rename(&temp_path, restore_to)
             .trace_err("Failed to move temporary restore directory")
             .map_err(|e| anyhow::anyhow!(e))?;
 
@@ -659,17 +661,35 @@ mod tests {
             .storage_as_mut::<Coins>()
             .insert(&key, &expected_value)
             .unwrap();
-        drop(combined_db);
+        combined_db.shutdown();
+        
+        // Verify data was written before backup
+        let verify_db = CombinedDatabase::open(
+            db_dir.path(),
+            StateRewindPolicy::NoRewind,
+            DatabaseConfig::config_for_tests(),
+        )
+        .unwrap();
+        let verify_value = verify_db
+            .on_chain()
+            .storage::<Coins>()
+            .get(&key)
+            .unwrap();
+        assert!(verify_value.is_some(), "Data should exist in source DB before backup");
+        drop(verify_db);
 
         // when
-        let backup_dir = TempDir::new().unwrap();
-        CombinedDatabase::backup(db_dir.path(), backup_dir.path()).unwrap();
+        let backup_parent = TempDir::new().unwrap();
+        let backup_dir = backup_parent.path().join("backup");
+        CombinedDatabase::backup(db_dir.path(), &backup_dir).unwrap();
 
         // then
-        let restore_dir = TempDir::new().unwrap();
-        CombinedDatabase::restore(restore_dir.path(), backup_dir.path()).unwrap();
+        let restore_parent = TempDir::new().unwrap();
+        let restore_dir = restore_parent.path().join("restore");
+        CombinedDatabase::restore(&restore_dir, &backup_dir).unwrap();
+        
         let restored_db = CombinedDatabase::open(
-            restore_dir.path(),
+            &restore_dir,
             StateRewindPolicy::NoRewind,
             DatabaseConfig::config_for_tests(),
         )
@@ -686,8 +706,8 @@ mod tests {
 
         // cleanup
         std::fs::remove_dir_all(db_dir.path()).unwrap();
-        std::fs::remove_dir_all(backup_dir.path()).unwrap();
-        std::fs::remove_dir_all(restore_dir.path()).unwrap();
+        std::fs::remove_dir_all(&backup_dir).unwrap();
+        std::fs::remove_dir_all(&restore_dir).unwrap();
     }
 
     #[test]
