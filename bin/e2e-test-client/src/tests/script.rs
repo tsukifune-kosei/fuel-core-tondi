@@ -123,15 +123,51 @@ pub async fn run_contract_large_state(ctx: &TestContext) -> Result<(), Failed> {
         .parse()
         .expect("Should be able to parse the salt");
     let contract_config = load_contract(salt, "./src/tests/test_data/large_state")?;
-    let dry_run = include_bytes!("test_data/large_state/tx.json");
-    let dry_run: Transaction = serde_json::from_slice(dry_run.as_ref())
-        .expect("Should be able do decode the Transaction");
+    let dry_run_bytes = include_bytes!("test_data/large_state/tx.json");
 
     // If the contract changed, you need to update the
-    // `f4292fe50d21668e140636ab69c7d4b3d069f66eb9ef3da4b0a324409cc36b8c` in the
+    // `1bfd51cb31b8d0bc7d93d38f97ab771267d8786ab87073e0c2b8f9ddc44b274e` in the
     // `test_data/large_state/state_config.json` together with:
-    // 244, 41, 47, 229, 13, 33, 102, 142, 20, 6, 54, 171, 105, 199, 212, 179, 208, 105, 246, 110, 185, 239, 61, 164, 176, 163, 36, 64, 156, 195, 107, 140,
+    // 27, 253, 81, 203, 49, 184, 208, 188, 125, 147, 211, 143, 151, 171, 119, 18, 103, 216, 120, 106, 184, 112, 115, 224, 194, 184, 249, 221, 196, 75, 39, 78,
     let contract_id = contract_config.contract_id;
+
+    // Update the contract ID in the transaction to match the deployed contract
+    // We need to modify the JSON and re-deserialize since Transaction is immutable
+    let mut tx_json: serde_json::Value = serde_json::from_slice(dry_run_bytes)
+        .expect("Should be able to parse the transaction JSON");
+    
+    // Update contract ID in inputs
+    if let Some(inputs) = tx_json.get_mut("Script").and_then(|s| s.get_mut("inputs")) {
+        if let Some(inputs_array) = inputs.as_array_mut() {
+            for input in inputs_array {
+                if let Some(contract_input) = input.get_mut("Contract") {
+                    if let Some(cid) = contract_input.get_mut("contract_id") {
+                        *cid = serde_json::Value::String(format!("{contract_id:x}"));
+                    }
+                }
+            }
+        }
+    }
+    
+    // Update contract ID in script_data (at offset 1, 32 bytes)
+    if let Some(script) = tx_json.get_mut("Script") {
+        if let Some(body) = script.get_mut("body") {
+            if let Some(script_data) = body.get_mut("script_data") {
+                if let Some(script_data_array) = script_data.as_array_mut() {
+                    if script_data_array.len() >= 33 {
+                        let cid_bytes: [u8; 32] = contract_id.into();
+                        for (i, byte) in cid_bytes.iter().enumerate() {
+                            script_data_array[1 + i] = serde_json::Value::Number((*byte).into());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Re-deserialize the updated transaction
+    let dry_run_tx: Transaction = serde_json::from_value(tx_json)
+        .expect("Should be able to decode the updated Transaction");
 
     // if the contract is not deployed yet, let's deploy it
     let result = ctx.bob.client.contract(&contract_id).await;
@@ -141,7 +177,7 @@ pub async fn run_contract_large_state(ctx: &TestContext) -> Result<(), Failed> {
         timeout(Duration::from_secs(90), deployment_request).await??;
     }
 
-    _dry_runs(ctx, &[dry_run], 100, DryRunResult::MayFail).await
+    _dry_runs(ctx, &[dry_run_tx], 100, DryRunResult::MayFail).await
 }
 
 pub async fn arbitrary_transaction(ctx: &TestContext) -> Result<(), Failed> {

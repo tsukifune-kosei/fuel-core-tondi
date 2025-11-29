@@ -1,5 +1,6 @@
 ---
 source: crates/chain-config/src/config/chain.rs
+assertion_line: 176
 expression: json
 ---
 {
@@ -312,7 +313,7 @@ expression: json
   "genesis_state_transition_version": 32,
   "consensus": {
     "PoAV2": {
-      "genesis_signing_key": "22ec92c3105c942a6640bdc4e4907286ec4728e8cfc0d8ac59aad4d8e1ccaefb",
+      "genesis_signing_key": "ef97eaeb2e85c20ac79c42b45438bd25384bfbd636695d083cdabad390dc2406",
       "signing_key_overrides": {}
     }
   }

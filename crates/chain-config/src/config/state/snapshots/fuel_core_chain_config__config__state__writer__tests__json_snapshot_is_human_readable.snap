@@ -1,5 +1,6 @@
 ---
 source: crates/chain-config/src/config/state/writer.rs
+assertion_line: 578
 expression: encoded_json
 ---
 {
@@ -43,17 +44,17 @@ expression: encoded_json
   ],
   "blobs": [
     {
-      "blob_id": "8acdb0431a136a5c0c100271704144e34aebe82cb426ced41461224e7798bceb",
+      "blob_id": "03faf7a551e61d75dbf6cd7e4bb49ea9b61f11abada39a690086301f5ff67f50",
       "payload": "d32d676c0ac47af4243e53915a314986c779af574aaf987302fc76b2e205b24e6e2b"
     },
     {
-      "blob_id": "fb57963e95792ded6eed1ddbf40329cc6bdcb91decb9042aba6385216d8c07e2",
+      "blob_id": "dac97cd152b5331d2a740f3d231b936b0a34d151beb893a9e6709addffa75ad3",
       "payload": "cb83691e8057f9e3ee966b281b5843029c002ea90022143aa9a8711d331894e545abb4a5ce6e6ae85ffb107712e030ddbe3a50f6a93ec455ff76b489e0f68a8a47ee42"
     }
   ],
   "contracts": [
     {
-      "contract_id": "6b97a1efc738a7508436290b7495f2fed59d0454463c189bb56cf0996c6acb1a",
+      "contract_id": "319aca7d2b12a66646e722e2d65e20d18a32cc321147dd87feced879c17edb3f",
       "code": "48d6696c30631735193aea95b8f9082c10620c0d6e3fc9596b4538d0dc24bec3",
       "tx_id": "1a6742c537f2bb32473b01b1dcb1caac942722a4787bb185e4791916926e5fdb",
       "output_index": 8485,
@@ -73,7 +74,7 @@ expression: encoded_json
       ]
     },
     {
-      "contract_id": "86cc533ae2e5151fa164130012dd3f09e8861767739da0c536da6da933caf851",
+      "contract_id": "74db690f86939200fea523f8e093961ebdee2c6dc82567058bf6e6f5c0dc95d3",
       "code": "4b297f047c3beda43d6e9f9b1b1bc44cdfce3574e7f7f0b2de2323a06ebc356b",
       "tx_id": "aa291871f4b9d120f76583a1da5d1123f2b8a0ac606b940a66e42efd782af520",
       "output_index": 561,

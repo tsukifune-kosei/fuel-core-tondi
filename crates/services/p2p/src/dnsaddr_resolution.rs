@@ -82,6 +82,7 @@ mod tests {
     use std::collections::HashSet;
 
     #[tokio::test]
+    #[ignore = "Depends on external DNS server - network test"]
     async fn dns_resolver__parses_all_multiaddresses_from_mainnet_dnsaddr_entry() {
         // given
         let resolver = DnsResolver::new().await.unwrap();
