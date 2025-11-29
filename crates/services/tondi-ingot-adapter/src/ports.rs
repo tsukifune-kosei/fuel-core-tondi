@@ -48,6 +48,39 @@ pub trait TondiRpcClient: Send + Sync {
         tx_id: &[u8; 32],
     ) -> Result<Option<(u64, [u8; 32])>>;
 
+    /// Check multiple transaction statuses in a single batch query.
+    ///
+    /// This is more efficient than calling `get_transaction_status` repeatedly
+    /// when the underlying RPC supports batch queries.
+    ///
+    /// Returns a map from tx_id to (block_height, instance_id) for confirmed txs.
+    ///
+    /// # Implementation Notes
+    ///
+    /// The default implementation calls `get_transaction_status` sequentially for
+    /// each tx_id. Implementors should override this method when:
+    ///
+    /// - Using Tondi Ingot Indexer: Use `queryTransactions` with txid filter
+    /// - Using a custom RPC: If batch query is supported
+    ///
+    /// ## Tondi API Status
+    ///
+    /// As of 2024, Tondi RPC only has single `get_transaction(hash)`.
+    /// The Ingot Indexer has `queryTransactions` which could be used for batch
+    /// queries by filtering on txid. Override this method to use it.
+    async fn get_multiple_transaction_statuses(
+        &self,
+        tx_ids: &[[u8; 32]],
+    ) -> Result<std::collections::HashMap<[u8; 32], (u64, [u8; 32])>> {
+        let mut results = std::collections::HashMap::new();
+        for tx_id in tx_ids {
+            if let Some((height, instance_id)) = self.get_transaction_status(tx_id).await? {
+                results.insert(*tx_id, (height, instance_id));
+            }
+        }
+        Ok(results)
+    }
+
     /// Get available UTXOs for the given address.
     async fn get_utxos(&self, address: &[u8]) -> Result<Vec<UtxoInfo>>;
 }
@@ -61,6 +94,14 @@ pub struct UtxoInfo {
     pub index: u32,
     /// UTXO value in SAU.
     pub value: u64,
+    /// Script public key of the UTXO (required for sighash computation).
+    pub script_public_key: Vec<u8>,
+    /// Script public key version.
+    pub script_version: u16,
+    /// Block DAA score when this UTXO was created.
+    pub block_daa_score: u64,
+    /// Whether this is a coinbase output.
+    pub is_coinbase: bool,
 }
 
 /// Port for signing transactions.
@@ -87,6 +128,11 @@ pub trait TondiSubmissionDatabase: Send + Sync {
     /// Get a batch record by number.
     fn get_batch(&self, batch_number: u64) -> Result<Option<BatchRecord>>;
 
+    /// Get a batch record by start height.
+    ///
+    /// This is used as a fallback to find batches when matching by tx_id fails.
+    fn get_batch_by_start_height(&self, start_height: u64) -> Result<Option<BatchRecord>>;
+
     /// Get batches with a specific status.
     fn get_batches_by_status(&self, status: SubmissionStatus)
         -> Result<Vec<BatchRecord>>;
@@ -99,6 +145,12 @@ pub trait TondiSubmissionDatabase: Send + Sync {
 
     /// Set the highest block height that has been submitted.
     fn set_submitted_height(&self, height: BlockHeight) -> Result<()>;
+
+    /// Get the last confirmed block hash (for parent_hash validation).
+    fn get_last_confirmed_block_hash(&self) -> Result<Option<[u8; 32]>>;
+
+    /// Set the last confirmed block hash.
+    fn set_last_confirmed_block_hash(&self, hash: [u8; 32]) -> Result<()>;
 }
 
 /// Notifier for block production events.
@@ -321,11 +373,26 @@ pub mod mock {
             }
         }
 
-        async fn get_utxos(&self, _address: &[u8]) -> Result<Vec<UtxoInfo>> {
+        async fn get_utxos(&self, address: &[u8]) -> Result<Vec<UtxoInfo>> {
+            // For mock: create a P2PK script from the provided public key
+            let script = if address.len() == 32 {
+                // X-only pubkey format: OP_DATA_32 <pubkey> OP_CHECKSIG
+                let mut script = vec![0x20]; // OP_DATA_32
+                script.extend_from_slice(address);
+                script.push(0xac); // OP_CHECKSIG
+                script
+            } else {
+                address.to_vec()
+            };
+
             Ok(vec![UtxoInfo {
                 tx_id: [0u8; 32],
                 index: 0,
                 value: 1_000_000_000, // 10 TDI
+                script_public_key: script,
+                script_version: 0,
+                block_daa_score: 0,
+                is_coinbase: false,
             }])
         }
     }

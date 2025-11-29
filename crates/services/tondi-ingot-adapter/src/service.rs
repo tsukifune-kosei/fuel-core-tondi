@@ -291,6 +291,10 @@ where
         self.inner.get_batch(batch_number)
     }
 
+    fn get_batch_by_start_height(&self, start_height: u64) -> Result<Option<crate::types::BatchRecord>> {
+        self.inner.get_batch_by_start_height(start_height)
+    }
+
     fn get_batches_by_status(
         &self,
         status: crate::types::SubmissionStatus,
@@ -308,6 +312,14 @@ where
 
     fn set_submitted_height(&self, height: fuel_core_types::fuel_types::BlockHeight) -> Result<()> {
         self.inner.set_submitted_height(height)
+    }
+
+    fn get_last_confirmed_block_hash(&self) -> Result<Option<[u8; 32]>> {
+        self.inner.get_last_confirmed_block_hash()
+    }
+
+    fn set_last_confirmed_block_hash(&self, hash: [u8; 32]) -> Result<()> {
+        self.inner.set_last_confirmed_block_hash(hash)
     }
 }
 
@@ -463,12 +475,11 @@ where
                 _ = interval.tick() => {
                     // Check if we should submit
                     let pending_count = self.adapter.pending_block_count().await;
-                    if pending_count >= self.config.min_batch_size as usize {
-                        if let Err(e) = self.adapter.submit_batch().await {
-                            tracing::error!(error = %e, "Failed to submit batch");
-                            self.update_state(SyncState::Error { message: e.to_string() });
-                            // Continue trying
-                        }
+                    let min_batch = self.config.min_batch_size as usize;
+                    if pending_count >= min_batch && self.adapter.submit_batch().await.is_err() {
+                        tracing::error!("Failed to submit batch");
+                        self.update_state(SyncState::Error { message: "Batch submission failed".to_string() });
+                        // Continue trying
                     }
 
                     // Check pending submissions for confirmation
@@ -490,11 +501,9 @@ where
         }
     }
 
-    fn shutdown(self) -> impl core::future::Future<Output = anyhow::Result<()>> + Send {
-        async move {
-            // Flush any remaining blocks
-            self.adapter.flush().await.map_err(anyhow::Error::from)
-        }
+    async fn shutdown(self) -> anyhow::Result<()> {
+        // Flush any remaining blocks
+        self.adapter.flush().await.map_err(anyhow::Error::from)
     }
 }
 
@@ -550,11 +559,10 @@ where
                 _ = submission_interval.tick() => {
                     // Check if we should submit
                     let pending_count = self.adapter.pending_block_count().await;
-                    if pending_count >= self.config.min_batch_size as usize {
-                        if let Err(e) = self.adapter.submit_batch().await {
-                            tracing::error!(error = %e, "Failed to submit batch");
-                            self.update_state(SyncState::Error { message: e.to_string() });
-                        }
+                    let min_batch = self.config.min_batch_size as usize;
+                    if pending_count >= min_batch && self.adapter.submit_batch().await.is_err() {
+                        tracing::error!("Failed to submit batch");
+                        self.update_state(SyncState::Error { message: "Batch submission failed".to_string() });
                     }
                     TaskNextAction::Continue
                 }
@@ -591,11 +599,9 @@ where
         }
     }
 
-    fn shutdown(self) -> impl core::future::Future<Output = anyhow::Result<()>> + Send {
-        async move {
-            // Flush any remaining blocks
-            self.adapter.flush().await.map_err(anyhow::Error::from)
-        }
+    async fn shutdown(self) -> anyhow::Result<()> {
+        // Flush any remaining blocks
+        self.adapter.flush().await.map_err(anyhow::Error::from)
     }
 }
 

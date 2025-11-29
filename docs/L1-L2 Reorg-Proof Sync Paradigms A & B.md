@@ -72,6 +72,113 @@ flowchart TB
 | `ConfirmationLevel` | `sync.rs` | 确认状态枚举 |
 | `SyncEvent` | `sync.rs` | 同步事件通知 |
 
+### 完整数据流
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        L2 提交流程 (Sequencer)                        │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  SealedBlock[N..M] ───> PayloadBuilder.build()                     │
+│                              │                                      │
+│                              ▼                                      │
+│                    FuelBlockBatchPayload {                          │
+│                      header: BatchHeader {                          │
+│                        version: 1,                                  │
+│                        start_height: N,                             │
+│                        block_count: M-N+1,                          │
+│                        parent_hash: blocks[0].prev_hash             │
+│                      },                                             │
+│                      blocks: [FuelBlockData...],                    │
+│                      commitment: BatchCommitment                    │
+│                    }                                                │
+│                              │                                      │
+│                              ▼                                      │
+│                    PayloadBuilder.encode()                          │
+│                              │                                      │
+│                              ▼ payload_bytes                        │
+│                    blake3(payload_bytes)                            │
+│                              │                                      │
+│                              ▼ hash_payload                         │
+│                    IngotOutput {                                    │
+│                      schema_id: blake3("fuelvm/batch/v1"),          │
+│                      hash_payload,                                  │
+│                      lock: PubKey { sequencer_pubkey }              │
+│                    }                                                │
+│                              │                                      │
+│                              ▼                                      │
+│                    compute_ingot_sig_msg() // ⚠️ Ingot-specific!    │
+│                              │                                      │
+│                              ▼ sig_msg                              │
+│                    signer.sign(sig_msg) → 64-byte signature         │
+│                              │                                      │
+│                              ▼                                      │
+│                    IngotWitness {                                   │
+│                      payload: Some(payload_bytes),                  │
+│                      auth_sigs: [signature] // ⚠️ 原始 64 字节!      │
+│                    }                                                │
+│                              │                                      │
+│                              ▼                                      │
+│                    Tondi Transaction                                │
+│                      inputs[0].signature_script = Borsh(witness)    │
+│                      outputs[0] = Pay2Ingot(ingot_output)           │
+│                              │                                      │
+│                              ▼                                      │
+│                    Submit to Tondi L1                               │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                     L2 接收流程 (Indexer Sync)                       │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Indexer.query(schema_id) ───> L1IngotRecord[]                     │
+│                                      │                              │
+│                                      ▼                              │
+│  1. 匹配 batch_number:                                              │
+│     - 优先: 通过 txid 匹配 pending_batches                           │
+│     - 备选: 通过 start_height 在 database 中查找                     │
+│                                      │                              │
+│                                      ▼                              │
+│  2. 验证 payload 完整性:                                             │
+│     - blake3(payload_data) == L1IngotRecord.payload_hash?           │
+│                                      │                              │
+│                                      ▼                              │
+│  3. 解码 payload:                                                    │
+│     - PayloadBuilder.decode(payload_data) → FuelBlockBatchPayload   │
+│                                      │                              │
+│                                      ▼                              │
+│  4. 验证 parent_hash (L2 链式关系):                                   │
+│     - payload.header.parent_hash == last_confirmed_block_hash?      │
+│     - 如果不匹配 → 检测到分叉!                                        │
+│                                      │                              │
+│                                      ▼                              │
+│  5. 验证 block_count:                                                │
+│     - payload.header.block_count == payload.blocks.len()?           │
+│                                      │                              │
+│                                      ▼                              │
+│  6. (可选) 执行 truncation 验证:                                      │
+│     - payload.validate_with_truncation(block_validator)             │
+│     - 返回 BatchValidationResult { valid_count, error }             │
+│                                      │                              │
+│                                      ▼                              │
+│  7. 更新状态:                                                        │
+│     - 更新 last_confirmed_block_hash                                 │
+│     - 发送 SyncEvent::BatchConfirmed / BatchFinalized               │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 关键验证点
+
+| 验证 | 位置 | 描述 |
+|------|------|------|
+| `hash_payload` | L1 + L2 | `blake3(witness.payload) == output.hash_payload` |
+| `parent_hash` | L2 Only | L2 链式关系，防止分叉 |
+| `sequencer_signature` | L1 | `Lock::PubKey` 验证 Ingot sighash |
+| `block_count` | L2 | 确保 header 与实际块数匹配 |
+| `truncation` | L2 | 逐块验证，失败时截断 |
+
 ### 实现代码
 
 ```rust
@@ -641,12 +748,14 @@ flowchart TB
 | 功能 | 状态 | 说明 |
 |------|------|------|
 | 批次提交 | ✅ | `TondiIngotAdapter.submit_batch()` |
-| TLV payload | ✅ | `PayloadBuilder.encode_tlv()` |
+| TLV payload | ✅ | `PayloadBuilder.encode()` |
 | Indexer 轮询 | ✅ | `IndexerSyncService.sync_once()` |
 | 确认追踪 | ✅ | `ConfirmationLevel` 状态机 |
 | 孤立检测 | ✅ | `check_orphaned_batches()` |
 | 事件通知 | ✅ | `SyncEvent` 枚举 |
 | 重提交调度 | ⚠️ | 需要 Block Producer 配合 |
+| Sighash 计算 | ✅ | `calc_schnorr_signature_hash` |
+| 手续费计算 | ✅ | `calculate_ingot_transaction_mass` |
 
 **关键设计原则**：
 
@@ -654,3 +763,159 @@ flowchart TB
 2. **配置驱动**：`SyncConfig` 控制同步行为，无需代码改动
 3. **增量实现**：Phase 1 完成后，Phase 2/3 是增量添加
 4. **事件驱动**：`SyncEvent` 允许上层服务响应状态变化
+
+---
+
+## L1 交易构建详解
+
+> ⚠️ **CRITICAL**: Ingot 交易使用**完全不同的签名机制**，不能使用标准 Tondi 的 `calc_schnorr_signature_hash()`！
+>
+> | 方面 | 标准 Tondi 交易 | Ingot 交易 |
+> |------|----------------|------------|
+> | Sighash 函数 | `calc_schnorr_signature_hash()` | `compute_ingot_sig_msg()` |
+> | 签名格式 | OP_DATA_65 + sig + type | 原始 64 字节 |
+> | 存储位置 | `signature_script` | `IngotWitness.auth_sigs` |
+> | 域标签 | Bitcoin-style | `"Ingot/SigMsg/v1"` |
+
+### Ingot 交易结构
+
+```text
+┌────────────────────────────────────────────────────────────────┐
+│  Tondi Transaction                                             │
+├────────────────────────────────────────────────────────────────┤
+│  Inputs:                                                       │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │ Input[0]: Funding UTXO                                   │  │
+│  │ - previous_outpoint: (txid, index)                       │  │
+│  │ - signature_script: Borsh(IngotWitness)                  │  │
+│  │   └── payload: Some(FuelBatchPayload) (≤85KB)            │  │
+│  │   └── auth_sigs: [64-byte raw Schnorr signature]         │  │
+│  │   └── script_reveal: None                                │  │
+│  │   └── mast_proof: None                                   │  │
+│  │ - sequence: 0                                            │  │
+│  │ - sig_op_count: 1                                        │  │
+│  └──────────────────────────────────────────────────────────┘  │
+├────────────────────────────────────────────────────────────────┤
+│  Outputs:                                                      │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │ Output[0]: Pay2Ingot (version=2)                         │  │
+│  │ - value: 100,000 SAU (configurable)                      │  │
+│  │ - script_public_key.version: 2 (INGOT_VERSION)           │  │
+│  │ - script_public_key.script: Borsh(IngotOutput)           │  │
+│  │   └── version: 0x01                                      │  │
+│  │   └── schema_id: blake3("fuelvm/batch/v1")               │  │
+│  │   └── hash_payload: blake3(FuelBatchPayload)             │  │
+│  │   └── flags: 0x0000                                      │  │
+│  │   └── lock: PubKey { pubkey, sig_type: CopperootSchnorr }│  │
+│  │   └── mast_root: None                                    │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │ Output[1]: Change (if > 1000 SAU)                        │  │
+│  │ - value: funding_value - ingot_value - fee               │  │
+│  │ - script_public_key: P2PK (OP_DATA_32 <pubkey> OP_CHECKSIG)│ │
+│  └──────────────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Sighash 计算
+
+⚠️ **重要**: Ingot 交易使用专用的 `compute_ingot_sig_msg()` 函数，**不是**标准的 `calc_schnorr_signature_hash()`！
+
+```rust
+// crates/services/tondi-ingot-adapter/src/adapter.rs
+use tondi_consensus_core::tx::ingot::{
+    compute_ingot_sig_msg,
+    NetworkId,
+};
+
+// 计算 Ingot 专用 sighash
+let sig_msg = compute_ingot_sig_msg(
+    &unsigned_tx,
+    input_index,
+    &spent_prevout,
+    &ingot_output,   // IngotOutput 包含 lock, hash_payload
+    NetworkId::Mainnet,
+)?;
+
+// 签名 (返回 64 字节原始 Schnorr 签名)
+let signature = signer.sign(sig_msg.as_bytes()).await?;
+```
+
+**Ingot Sighash 包含的数据** (与标准 Tondi 不同！):
+1. 域标签: `"Ingot/SigMsg/v1"`
+2. Network ID byte (Mainnet=0x01, Testnet=0x02, ...)
+3. Transaction ID (wtxid)
+4. Input index (u32 little-endian)
+5. Spent prevout (txid + vout)
+6. Lock bytes (Borsh 序列化的 Lock 结构)
+7. Payload hash (hash_payload)
+8. MAST root (如果存在)
+
+### 手续费计算
+
+Tondi 使用 "mass" 概念计算手续费，类似于 Bitcoin 的 weight：
+
+```rust
+use tondi_consensus_core::tx::ingot::calculate_ingot_transaction_mass;
+
+// 计算交易 mass (包含 witness 大小的加权)
+let mass = calculate_ingot_transaction_mass(&inputs, &outputs);
+
+// 手续费 = max(mass, 1000) SAU
+// 1 SAU per mass unit, 最低 1000 SAU
+let fee = std::cmp::max(mass, 1000);
+```
+
+**Mass 计算考虑**:
+- 基础交易开销 (~100 bytes)
+- 输入大小 (包含 signature_script)
+- 输出大小 (包含 IngotOutput)
+- Witness 大小加权 (大于 8KB 的 witness 有额外 surcharge)
+
+| Witness Size | Overhead Factor |
+|--------------|-----------------|
+| 0-1KB        | 1.0x            |
+| 1-8KB        | 1.2x            |
+| 8-32KB       | 1.5x            |
+| 32-64KB      | 2.0x            |
+| >64KB        | 2.5x            |
+
+### UtxoInfo 接口
+
+UTXO 信息用于交易构建（计算费用和找零）：
+
+```rust
+// crates/services/tondi-ingot-adapter/src/ports.rs
+pub struct UtxoInfo {
+    pub tx_id: [u8; 32],
+    pub index: u32,
+    pub value: u64,
+    pub script_public_key: Vec<u8>,  // 用于创建找零输出
+    pub script_version: u16,
+    pub block_daa_score: u64,
+    pub is_coinbase: bool,
+}
+```
+
+**注意**: Ingot sighash 不需要完整的 UtxoEntry 数据，因为它使用 `compute_ingot_sig_msg()` 而非标准 sighash。
+
+### 签名格式
+
+⚠️ **重要**: `IngotWitness.auth_sigs` 期望**原始 64 字节 Schnorr 签名**，不是 `OP_DATA_65` 格式！
+
+```rust
+// IngotWitness 期望原始 64 字节签名
+let witness = IngotWitness {
+    payload: Some(payload),
+    auth_sigs: vec![signature],  // 64 字节原始 Schnorr 签名
+    script_reveal: None,
+    mast_proof: None,
+};
+
+// signature_script = Borsh(IngotWitness)
+let witness_script = create_ingot_signature_script(&witness)?;
+```
+
+**签名类型 (在 IngotOutput.lock 中指定)**:
+- `CopperootSchnorr` (0x01): BLAKE3 sighash + BIP340 Schnorr (Tondi 原生)
+- `StandardSchnorr` (0x04): SHA256 sighash + BIP340 Schnorr (Bitcoin 兼容)

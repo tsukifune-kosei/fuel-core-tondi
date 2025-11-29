@@ -23,15 +23,18 @@ use crate::{
         TondiSubmissionDatabase,
     },
     types::{
+        BatchInfo,
         BatchRecord,
         SubmissionStatus,
     },
 };
-use fuel_core_types::blockchain::SealedBlock;
+use fuel_core_types::{
+    blockchain::SealedBlock,
+    fuel_types::BlockHeight,
+};
 use std::time::Instant;
 use tokio::sync::{mpsc, Mutex};
 use tondi_consensus_core::tx::ingot::{
-    create_ingot_output,
     IngotFlags,
     IngotOutput,
     Lock,
@@ -170,19 +173,16 @@ where
             num
         };
 
-        // Get parent reference
+        // Get parent reference (for Ingot chain, not used in FuelBatchPayload)
         let parent_ref = *self.last_instance_id.lock().await;
 
         // Build payload
-        let mut builder = PayloadBuilder::new(self.config.clone(), batch_number);
-        builder = builder.add_blocks(blocks);
-        if let Some(parent) = parent_ref {
-            builder = builder.with_parent_ref(parent);
-        }
+        let builder = PayloadBuilder::new(self.config.clone());
+        let builder = builder.add_blocks(blocks);
         let payload = builder.build()?;
 
-        // Encode payload as TLV
-        let payload_bytes = PayloadBuilder::encode_tlv(&payload)?;
+        // Encode payload for IngotWitness.payload
+        let payload_bytes = PayloadBuilder::encode(&payload)?;
         let payload_hash = Hash::from_bytes(*blake3::hash(&payload_bytes).as_bytes());
 
         // Build Ingot output
@@ -204,8 +204,26 @@ where
 
         let tx_id = self.rpc_client.submit_transaction(tx_bytes).await?;
 
+        // Create BatchInfo from header
+        // Heights are stored as u64 in BatchHeader but FuelVM uses u32
+        // Saturate to u32::MAX if overflow (which shouldn't happen in practice)
+        let start_height = u32::try_from(payload.header.start_height)
+            .unwrap_or(u32::MAX);
+        let end_height = u32::try_from(payload.header.end_height())
+            .unwrap_or(u32::MAX);
+        let batch_info = BatchInfo::new(
+            batch_number,
+            BlockHeight::from(start_height),
+            BlockHeight::from(end_height),
+            payload.header.block_count,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        );
+
         // Create and store batch record
-        let mut record = BatchRecord::new_pending(payload.batch_info.clone(), payload.commitment);
+        let mut record = BatchRecord::new_pending(batch_info, payload.commitment);
         record.mark_submitted(tx_id, parent_ref);
         self.database.store_batch(&record)?;
 
@@ -275,12 +293,30 @@ where
         Ok(())
     }
 
-    /// Build an Ingot transaction.
+    /// Build an Ingot transaction with proper Ingot-specific sighash and fee calculation.
     ///
-    /// # Arguments
-    /// * `ingot_output` - The Ingot output to include in the transaction
-    /// * `payload` - The payload data to include in the witness
-    /// * `_is_genesis` - Whether this is the genesis batch (unused currently)
+    /// ## Critical: Ingot Sighash is Different!
+    ///
+    /// Ingot transactions use `compute_ingot_sig_msg()` NOT `calc_schnorr_signature_hash()`:
+    /// - Domain tag: `"Ingot/SigMsg/v1"`
+    /// - Includes: network_id, txid, input_index, prevout, lock, hash_payload, mast_root
+    ///
+    /// ## IngotWitness.auth_sigs Format
+    ///
+    /// The `auth_sigs` field expects **raw 64-byte Schnorr signatures**, NOT the
+    /// signature script format (`OP_DATA_65 + sig + sighash_type`).
+    ///
+    /// # Transaction Structure
+    /// ```text
+    /// ┌────────────────────────────────────────────────────────────────┐
+    /// │  Inputs:                                                       │
+    /// │  - Funding UTXO (signature_script = Borsh(IngotWitness))       │
+    /// ├────────────────────────────────────────────────────────────────┤
+    /// │  Outputs:                                                      │
+    /// │  - Ingot Output (Pay2Ingot with FuelVM batch data)             │
+    /// │  - Change Output (if needed)                                   │
+    /// └────────────────────────────────────────────────────────────────┘
+    /// ```
     async fn build_ingot_transaction(
         &self,
         ingot_output: IngotOutput,
@@ -289,13 +325,18 @@ where
     ) -> Result<Vec<u8>> {
         use tondi_consensus_core::subnets::SUBNETWORK_ID_NATIVE;
         use tondi_consensus_core::tx::ingot::{
+            calculate_ingot_transaction_mass,
+            compute_ingot_sig_msg,
+            create_ingot_output,
             create_ingot_signature_script,
             IngotWitness,
+            NetworkId,
         };
         use tondi_consensus_core::tx::{
             Transaction,
             TransactionInput,
             TransactionOutpoint,
+            TransactionOutput,
         };
 
         // Get UTXOs for funding
@@ -309,52 +350,126 @@ where
         // Use first UTXO for funding
         let funding_utxo = &utxos[0];
 
-        // Create Ingot output with configurable value
+        // Create Ingot output
         let ingot_value = Config::DEFAULT_INGOT_OUTPUT_VALUE;
         let ingot_tx_output = create_ingot_output(ingot_value, ingot_output.clone())
             .map_err(|e| TondiAdapterError::PayloadBuild(e.to_string()))?;
 
-        // Create funding input (unsigned)
+        // Estimate transaction mass for fee calculation
+        let estimated_witness_size = payload.len().saturating_add(100); // payload + auth overhead
+        let estimated_input = TransactionInput {
+            previous_outpoint: TransactionOutpoint::new(
+                Hash::from_bytes(funding_utxo.tx_id),
+                funding_utxo.index,
+            ),
+            signature_script: vec![0u8; estimated_witness_size],
+            sequence: 0,
+            sig_op_count: 1,
+        };
+        let mass = calculate_ingot_transaction_mass(
+            std::slice::from_ref(&estimated_input),
+            std::slice::from_ref(&ingot_tx_output),
+        );
+
+        // Calculate fee based on mass (1 SAU per mass unit, minimum 1000)
+        let fee = std::cmp::max(mass, 1000);
+
+        // Check if we have enough funds
+        let total_needed = ingot_value.saturating_add(fee);
+        if funding_utxo.value < total_needed {
+            return Err(TondiAdapterError::Submission(format!(
+                "Insufficient funds: have {} SAU, need {} SAU (value: {}, fee: {})",
+                funding_utxo.value, total_needed, ingot_value, fee
+            )));
+        }
+
+        // Calculate change
+        let change = funding_utxo.value.saturating_sub(total_needed);
+
+        // Build outputs list
+        let mut outputs = vec![ingot_tx_output.clone()];
+
+        // Add change output if significant (> dust threshold of 1000 SAU)
+        if change > 1000 {
+            // Create P2PK change output to our own public key
+            let pubkey = self.signer.public_key();
+            let change_spk = if pubkey.len() == 32 {
+                // X-only pubkey: OP_DATA_32 <pubkey> OP_CHECKSIG
+                let mut script = vec![0x20]; // OP_DATA_32
+                script.extend_from_slice(&pubkey);
+                script.push(0xac); // OP_CHECKSIG
+                tondi_consensus_core::tx::ScriptPublicKey::from_vec(0, script)
+            } else {
+                tondi_consensus_core::tx::ScriptPublicKey::from_vec(0, pubkey)
+            };
+            outputs.push(TransactionOutput {
+                value: change,
+                script_public_key: change_spk,
+            });
+        }
+
+        // Create funding input (initially with empty signature_script)
         let funding_input = TransactionInput {
             previous_outpoint: TransactionOutpoint::new(
                 Hash::from_bytes(funding_utxo.tx_id),
                 funding_utxo.index,
             ),
-            signature_script: vec![], // Will be signed
+            signature_script: vec![], // Will be filled with IngotWitness
             sequence: 0,
             sig_op_count: 1,
         };
 
-        // Build unsigned transaction for sighash computation
+        // Build unsigned transaction (needed for txid computation in sighash)
         let unsigned_tx = Transaction::new(
             1, // version
-            vec![funding_input.clone()],
-            vec![ingot_tx_output.clone()],
+            vec![funding_input],
+            outputs,
             0, // locktime
             SUBNETWORK_ID_NATIVE,
-            0, // gas
+            0, // gas (native transactions don't use gas field)
             vec![],
         );
 
-        // Compute sighash and sign
-        // TODO: Use proper sighash computation from tondi_consensus_core::tx::sign
-        // For now, we hash the serialized transaction as a placeholder
-        let tx_bytes = borsh::to_vec(&unsigned_tx)
-            .map_err(|e| TondiAdapterError::Serialization(e.to_string()))?;
-        let sighash = blake3::hash(&tx_bytes);
+        // Compute Ingot-specific sighash
+        // CRITICAL: Ingot uses compute_ingot_sig_msg(), NOT calc_schnorr_signature_hash()!
+        let spent_prevout = TransactionOutpoint::new(
+            Hash::from_bytes(funding_utxo.tx_id),
+            funding_utxo.index,
+        );
+        let input_index = 0;
+        let network_id = NetworkId::Mainnet; // TODO: Make configurable
 
-        let signature = self.signer.sign(sighash.as_bytes()).await?;
+        let sig_msg = compute_ingot_sig_msg(
+            &unsigned_tx,
+            input_index,
+            &spent_prevout,
+            &ingot_output,
+            network_id,
+        )
+        .map_err(|e| TondiAdapterError::Signing(format!("Failed to compute sighash: {:?}", e)))?;
 
-        // Create witness with payload and signature
-        let witness_with_sig = IngotWitness {
+        // Sign the sighash (returns 64-byte raw Schnorr signature)
+        let signature = self.signer.sign(sig_msg.as_bytes().as_slice()).await?;
+
+        // Validate signature length
+        if signature.len() != 64 {
+            return Err(TondiAdapterError::Signing(format!(
+                "Expected 64-byte Schnorr signature, got {} bytes",
+                signature.len()
+            )));
+        }
+
+        // Create IngotWitness with payload and raw signature
+        // NOTE: auth_sigs expects raw 64-byte signatures, NOT OP_DATA_65 format!
+        let witness = IngotWitness {
             payload: Some(payload),
-            auth_sigs: vec![signature],
+            auth_sigs: vec![signature], // Raw 64-byte Schnorr signature
             script_reveal: None,
             mast_proof: None,
         };
 
-        // Create signature script from witness
-        let witness_script = create_ingot_signature_script(&witness_with_sig)
+        // Create signature_script from IngotWitness (Borsh serialized)
+        let witness_script = create_ingot_signature_script(&witness)
             .map_err(|e| TondiAdapterError::Signing(e.to_string()))?;
 
         // Create signed input
@@ -368,55 +483,75 @@ where
             sig_op_count: 1,
         };
 
-        // Build final signed transaction with the original ingot_output
+        // Build final signed transaction
         let signed_tx = Transaction::new(
-            1, // version
+            1,
             vec![signed_input],
-            vec![ingot_tx_output], // Use the original output, not a new one
-            0, // locktime
+            unsigned_tx.outputs,
+            0,
             SUBNETWORK_ID_NATIVE,
-            0, // gas
+            0,
             vec![],
         );
 
+        // Serialize final signed transaction
         borsh::to_vec(&signed_tx)
             .map_err(|e| TondiAdapterError::Serialization(e.to_string()))
     }
 
     /// Check for pending batches and update their status.
+    ///
+    /// Uses batch query to efficiently check multiple transaction statuses
+    /// in a single RPC call.
     pub async fn check_pending_submissions(&self) -> Result<()> {
         let pending = self
             .database
             .get_batches_by_status(SubmissionStatus::Submitted)?;
 
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        // Collect all tx_ids for batch query
+        let tx_ids: Vec<[u8; 32]> = pending
+            .iter()
+            .filter_map(|r| r.tondi_tx_id)
+            .collect();
+
+        if tx_ids.is_empty() {
+            return Ok(());
+        }
+
+        // Batch query for all transaction statuses
+        let statuses = match self.rpc_client.get_multiple_transaction_statuses(&tx_ids).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    pending_count = pending.len(),
+                    "Failed to batch query transaction statuses"
+                );
+                return Err(e);
+            }
+        };
+
+        // Update confirmed batches
         for mut record in pending {
-            if let Some(tx_id) = record.tondi_tx_id {
-                match self.rpc_client.get_transaction_status(&tx_id).await {
-                    Ok(Some((block_height, instance_id))) => {
-                        record.mark_confirmed(block_height, instance_id);
-                        self.database.update_batch(&record)?;
+            if let Some(tx_id) = record.tondi_tx_id
+                && let Some(&(block_height, instance_id)) = statuses.get(&tx_id)
+            {
+                record.mark_confirmed(block_height, instance_id);
+                self.database.update_batch(&record)?;
 
-                        // Update last instance ID
-                        *self.last_instance_id.lock().await = Some(instance_id);
+                // Update last instance ID
+                *self.last_instance_id.lock().await = Some(instance_id);
 
-                        tracing::info!(
-                            batch_number = record.info.batch_number,
-                            tondi_block = block_height,
-                            instance_id = %hex::encode(instance_id),
-                            "Batch confirmed on Tondi L1"
-                        );
-                    }
-                    Ok(None) => {
-                        // Still pending, continue
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            batch_number = record.info.batch_number,
-                            error = %e,
-                            "Failed to check batch status"
-                        );
-                    }
-                }
+                tracing::info!(
+                    batch_number = record.info.batch_number,
+                    tondi_block = block_height,
+                    instance_id = %hex::encode(instance_id),
+                    "Batch confirmed on Tondi L1"
+                );
             }
         }
 

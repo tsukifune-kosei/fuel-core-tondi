@@ -7,6 +7,261 @@ use serde::{
 };
 use std::time::Instant;
 
+/// FuelVM batch header for quick validation.
+///
+/// This header is placed at the **start of the FuelBatchPayload** (inside IngotWitness.payload)
+/// to allow L2 indexers to quickly check batch relevance before full deserialization.
+///
+/// ## Wire Format (45 bytes, fixed size)
+/// ```text
+/// ┌─────────────────────────────────────────────────────────────┐
+/// │  version: u8           (1 byte)  - Protocol version         │
+/// │  start_height: u64     (8 bytes) - First block height       │
+/// │  block_count: u32      (4 bytes) - Number of blocks         │
+/// │  parent_hash: [u8; 32] (32 bytes) - L2 chain continuity     │
+/// └─────────────────────────────────────────────────────────────┘
+/// ```
+///
+/// ## Security Model
+/// - **Authentication**: Handled by IngotOutput.lock = PubKey { sequencer_pubkey }
+///   and IngotWitness.auth_sigs containing the Schnorr signature
+/// - **Chain Continuity**: parent_hash must match the last confirmed L2 block hash
+/// - **Data Binding**: IngotOutput.hash_payload = blake3(entire FuelBatchPayload)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchHeader {
+    /// Protocol version (for future upgrades).
+    pub version: u8,
+    /// First block height in the batch.
+    pub start_height: u64,
+    /// Number of blocks in the batch.
+    pub block_count: u32,
+    /// Parent hash of the first block (L2 chain continuity verification).
+    /// This is the block hash of the last L2 block before this batch.
+    pub parent_hash: [u8; 32],
+}
+
+impl BatchHeader {
+    /// Current protocol version.
+    pub const VERSION: u8 = 1;
+
+    /// Size of the serialized header in bytes.
+    /// 1 + 8 + 4 + 32 = 45 bytes
+    pub const SERIALIZED_SIZE: usize = 1 + 8 + 4 + 32;
+
+    /// Create a new BatchHeader.
+    pub fn new(
+        start_height: u64,
+        block_count: u32,
+        parent_hash: [u8; 32],
+    ) -> Self {
+        Self {
+            version: Self::VERSION,
+            start_height,
+            block_count,
+            parent_hash,
+        }
+    }
+
+    /// Get the end height (calculated from start_height + block_count - 1).
+    pub fn end_height(&self) -> u64 {
+        self.start_height
+            .saturating_add(self.block_count as u64)
+            .saturating_sub(1)
+    }
+
+    /// Serialize the header to a fixed-size byte array.
+    pub fn to_bytes(&self) -> [u8; Self::SERIALIZED_SIZE] {
+        let mut bytes = [0u8; Self::SERIALIZED_SIZE];
+        bytes[0] = self.version;
+        bytes[1..9].copy_from_slice(&self.start_height.to_le_bytes());
+        bytes[9..13].copy_from_slice(&self.block_count.to_le_bytes());
+        bytes[13..45].copy_from_slice(&self.parent_hash);
+        bytes
+    }
+
+    /// Deserialize a header from bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::SERIALIZED_SIZE {
+            return None;
+        }
+
+        let version = bytes[0];
+        let start_height = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
+        let block_count = u32::from_le_bytes(bytes[9..13].try_into().ok()?);
+        let parent_hash: [u8; 32] = bytes[13..45].try_into().ok()?;
+
+        Some(Self {
+            version,
+            start_height,
+            block_count,
+            parent_hash,
+        })
+    }
+
+    /// Validate basic header consistency.
+    pub fn is_valid(&self) -> bool {
+        // Version check
+        if self.version == 0 || self.version > Self::VERSION {
+            return false;
+        }
+
+        // Block count must be at least 1
+        if self.block_count == 0 {
+            return false;
+        }
+
+        true
+    }
+
+    /// Check if this batch follows the given parent.
+    pub fn follows_parent(&self, parent_last_hash: &[u8; 32]) -> bool {
+        self.parent_hash == *parent_last_hash
+    }
+
+    /// Check if this batch contains a specific height.
+    pub fn contains_height(&self, height: u64) -> bool {
+        height >= self.start_height && height <= self.end_height()
+    }
+}
+
+/// Result of batch validation with truncation support.
+#[derive(Debug, Clone)]
+pub struct BatchValidationResult {
+    /// Number of valid blocks (starting from the first).
+    pub valid_count: u32,
+    /// First invalid block height (if any).
+    pub first_invalid_height: Option<u64>,
+    /// Validation error for the first invalid block.
+    pub error: Option<BlockValidationError>,
+    /// Whether the batch was truncated.
+    pub truncated: bool,
+}
+
+impl BatchValidationResult {
+    /// Create a successful validation result (all blocks valid).
+    pub fn success(block_count: u32) -> Self {
+        Self {
+            valid_count: block_count,
+            first_invalid_height: None,
+            error: None,
+            truncated: false,
+        }
+    }
+
+    /// Create a truncated validation result.
+    pub fn truncated(
+        valid_count: u32,
+        first_invalid_height: u64,
+        error: BlockValidationError,
+    ) -> Self {
+        Self {
+            valid_count,
+            first_invalid_height: Some(first_invalid_height),
+            error: Some(error),
+            truncated: true,
+        }
+    }
+
+    /// Check if any blocks were accepted.
+    pub fn has_valid_blocks(&self) -> bool {
+        self.valid_count > 0
+    }
+
+    /// Check if all blocks were valid.
+    pub fn is_complete(&self) -> bool {
+        !self.truncated
+    }
+}
+
+/// Block validation error types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockValidationError {
+    /// Block has an invalid signature.
+    InvalidSignature {
+        /// Block height.
+        height: u64,
+        /// Expected signer.
+        expected_signer: Option<Vec<u8>>,
+    },
+    /// Transaction in block is invalid.
+    InvalidTransaction {
+        /// Block height.
+        height: u64,
+        /// Transaction index.
+        tx_index: usize,
+        /// Error details.
+        details: String,
+    },
+    /// State transition is invalid.
+    InvalidStateTransition {
+        /// Block height.
+        height: u64,
+        /// Expected state root.
+        expected_root: [u8; 32],
+        /// Actual state root.
+        actual_root: [u8; 32],
+    },
+    /// Double spend detected.
+    DoubleSpend {
+        /// Block height.
+        height: u64,
+        /// UTXO identifier.
+        utxo_id: Vec<u8>,
+    },
+    /// Block header is invalid.
+    InvalidBlockHeader {
+        /// Block height.
+        height: u64,
+        /// Error details.
+        details: String,
+    },
+    /// Missing parent block.
+    MissingParent {
+        /// Block height.
+        height: u64,
+        /// Expected parent hash.
+        expected_parent: [u8; 32],
+    },
+    /// Height mismatch in contiguous block sequence.
+    HeightMismatch {
+        /// Expected height.
+        expected: u64,
+        /// Actual height.
+        actual: u64,
+    },
+    /// Other validation error.
+    Other(String),
+}
+
+impl std::fmt::Display for BlockValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSignature { height, .. } => {
+                write!(f, "Invalid signature at block {}", height)
+            }
+            Self::InvalidTransaction { height, tx_index, details } => {
+                write!(f, "Invalid tx {} at block {}: {}", tx_index, height, details)
+            }
+            Self::InvalidStateTransition { height, .. } => {
+                write!(f, "Invalid state transition at block {}", height)
+            }
+            Self::DoubleSpend { height, .. } => {
+                write!(f, "Double spend detected at block {}", height)
+            }
+            Self::InvalidBlockHeader { height, details } => {
+                write!(f, "Invalid block header at {}: {}", height, details)
+            }
+            Self::MissingParent { height, .. } => {
+                write!(f, "Missing parent for block {}", height)
+            }
+            Self::HeightMismatch { expected, actual } => {
+                write!(f, "Height mismatch: expected {}, got {}", expected, actual)
+            }
+            Self::Other(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
 /// Information about a submitted batch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchInfo {

@@ -73,9 +73,12 @@ pub use storage::TondiSubmissionDb;
 pub use sync::{ConfirmationLevel, IndexerSyncService, SyncEvent};
 pub use types::{
     BatchCommitment,
+    BatchHeader,
     BatchInfo,
     BatchL1Status,
     BatchRecord,
+    BatchValidationResult,
+    BlockValidationError,
     PendingBatch,
     SubmissionStatus,
 };
