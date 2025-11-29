@@ -1,0 +1,182 @@
+{
+  "$comment": "schema_id = blake3('fuelvm/batch/v1') - computed at runtime by Config::schema_id_bytes()",
+  "schema_string": "fuelvm/batch/v1",
+  "schema_name": "FuelVM Block Batch",
+  "schema_version": "1.0.0",
+  "description": "FuelVM Sovereign Rollup block batch for Tondi L1 data availability",
+  "compatible_with": ["Fuel V2", "FuelVM"],
+  
+  "payload_format": "binary",
+  "encoding": "custom_tlv",
+  
+  "header": {
+    "description": "Fixed-size batch header (45 bytes) at payload start for quick indexer validation",
+    "format": "packed_binary",
+    "fields": {
+      "version": {
+        "type": "u8",
+        "offset": 0,
+        "size": 1,
+        "value": 1,
+        "description": "Batch format version"
+      },
+      "start_height": {
+        "type": "u64_le",
+        "offset": 1,
+        "size": 8,
+        "description": "First block height in batch"
+      },
+      "block_count": {
+        "type": "u32_le",
+        "offset": 9,
+        "size": 4,
+        "description": "Number of blocks in batch"
+      },
+      "parent_hash": {
+        "type": "bytes32",
+        "offset": 13,
+        "size": 32,
+        "description": "Parent block hash (L2 chain continuity)"
+      }
+    },
+    "total_size": 45
+  },
+  
+  "tlv_types": {
+    "0x1001": {
+      "name": "FUEL_BLOCKS",
+      "description": "Postcard-serialized FuelVM block data array",
+      "required": true,
+      "content_format": "postcard_serialized",
+      "fields_per_block": {
+        "height": "u64",
+        "block_hash": "bytes32",
+        "prev_block_hash": "bytes32",
+        "transactions_root": "bytes32",
+        "transactions_data": "bytes",
+        "timestamp": "u64"
+      }
+    },
+    "0x1002": {
+      "name": "FUEL_COMMITMENT",
+      "description": "State commitment for ZK proofs and light client bridges",
+      "required": true,
+      "content_format": "postcard_serialized",
+      "fields": {
+        "initial_state_root": "bytes32",
+        "final_state_root": "bytes32",
+        "receipts_root": "bytes32"
+      }
+    }
+  },
+  
+  "validation_rules": {
+    "max_payload_size": 87040,
+    "max_payload_size_note": "85 KiB recommended limit for Ingot Witness",
+    "max_blocks_per_batch": 100,
+    "block_continuity": true,
+    "block_continuity_note": "Blocks must be contiguous heights",
+    "parent_hash_validation": true,
+    "parent_hash_note": "parent_hash must match last confirmed block hash"
+  },
+  
+  "security": {
+    "authentication": {
+      "method": "IngotOutput.lock",
+      "lock_type": "PubKey",
+      "signature_type": "CopperootSchnorr",
+      "description": "Sequencer signs using compute_ingot_sig_msg()"
+    },
+    "chain_continuity": {
+      "field": "header.parent_hash",
+      "validation": "L2 indexer validates against last confirmed block",
+      "purpose": "Prevent L2 forks"
+    },
+    "data_binding": {
+      "method": "IngotOutput.hash_payload",
+      "hash_function": "blake3",
+      "description": "L1 commits to blake3(full_payload)"
+    }
+  },
+  
+  "truncation_strategy": {
+    "description": "If a block in batch is invalid, accept valid preceding blocks and discard the rest",
+    "validation_order": "sequential",
+    "on_invalid_block": {
+      "action": "truncate",
+      "accept_valid_prefix": true,
+      "discard_invalid_and_following": true
+    }
+  },
+  
+  "ingot_integration": {
+    "output_structure": {
+      "version": "0x01",
+      "schema_id": "blake3('fuelvm/batch/v1')",
+      "hash_payload": "blake3(full_payload)",
+      "flags": "0x0000",
+      "lock": "PubKey { sequencer_pubkey, CopperootSchnorr }",
+      "mast_root": "None"
+    },
+    "witness_structure": {
+      "payload": "FuelBatchPayload (BatchHeader + TLV blocks + commitment)",
+      "auth_sigs": ["64-byte raw Schnorr signature"],
+      "script_reveal": "None",
+      "mast_proof": "None"
+    },
+    "sighash": {
+      "function": "compute_ingot_sig_msg()",
+      "includes": [
+        "domain tag: 'Ingot/SigMsg/v1'",
+        "network_id",
+        "txid",
+        "input_index",
+        "spent_prevout",
+        "lock bytes",
+        "hash_payload"
+      ],
+      "warning": "NOT standard Tondi sighash!"
+    }
+  },
+  
+  "l2_indexing": {
+    "schema_filter": true,
+    "track_by_start_height": true,
+    "track_by_txid": true,
+    "validate_parent_hash": true,
+    "execute_truncation": true
+  },
+  
+  "examples": {
+    "single_block_batch": {
+      "header": {
+        "version": 1,
+        "start_height": 100,
+        "block_count": 1,
+        "parent_hash": "0x0000...prev_block_hash"
+      },
+      "blocks": [
+        {
+          "height": 100,
+          "block_hash": "0x...",
+          "prev_block_hash": "0x...",
+          "transactions_root": "0x...",
+          "transactions_data": "<postcard bytes>",
+          "timestamp": 1700000000
+        }
+      ],
+      "commitment": {
+        "initial_state_root": "0x...",
+        "final_state_root": "0x...",
+        "receipts_root": "0x..."
+      }
+    }
+  },
+  
+  "notes": {
+    "sovereign_mode": "This schema is for Sovereign Rollup mode where L2 validates itself",
+    "based_mode": "Future Based mode may use different authentication",
+    "compression": "Transactions data may be compressed (implementation detail)"
+  }
+}
+
