@@ -108,6 +108,146 @@ pub trait BlockNotifier: Send + Sync {
     async fn notify_block(&self, block: SealedBlock) -> Result<()>;
 }
 
+/// Port for Tondi Indexer RPC operations.
+///
+/// This trait defines the interface for querying the Tondi Ingot Indexer
+/// to track batch confirmation status and detect reorgs (Plan B approach).
+#[async_trait]
+pub trait TondiIndexerClient: Send + Sync {
+    /// Get indexer statistics.
+    async fn get_stats(&self) -> Result<IndexerStats>;
+
+    /// Query transactions by schema ID.
+    ///
+    /// Returns Ingot transactions matching the FuelVM schema, optionally
+    /// filtered by DAA score range.
+    async fn query_transactions(
+        &self,
+        options: IndexerQueryOptions,
+    ) -> Result<Vec<L1IngotRecord>>;
+
+    /// Get a specific transaction by instance ID.
+    async fn get_transaction(
+        &self,
+        instance_id: &[u8; 32],
+    ) -> Result<Option<L1IngotRecord>>;
+
+    /// Get transaction status by transaction ID.
+    ///
+    /// Returns the L1 inclusion status of a submitted transaction.
+    async fn get_tx_status(&self, tx_id: &[u8; 32]) -> Result<L1TxStatus>;
+}
+
+/// Query options for the Tondi Indexer.
+#[derive(Debug, Clone, Default)]
+pub struct IndexerQueryOptions {
+    /// Pagination offset.
+    pub offset: usize,
+    /// Maximum results to return.
+    pub limit: usize,
+    /// Filter by schema ID.
+    pub schema_id: Option<[u8; 32]>,
+    /// Minimum DAA score (bluescore) filter.
+    pub min_daa_score: Option<u64>,
+    /// Maximum DAA score filter.
+    pub max_daa_score: Option<u64>,
+    /// Include spent transactions.
+    pub include_spent: bool,
+    /// Sort order.
+    pub sort_desc: bool,
+}
+
+impl IndexerQueryOptions {
+    /// Create options for querying FuelVM batches.
+    pub fn for_fuel_batches(schema_id: [u8; 32], from_daa_score: Option<u64>) -> Self {
+        Self {
+            offset: 0,
+            limit: 100,
+            schema_id: Some(schema_id),
+            min_daa_score: from_daa_score,
+            max_daa_score: None,
+            include_spent: false,
+            sort_desc: false, // Oldest first
+        }
+    }
+}
+
+/// Record of an Ingot transaction indexed on L1.
+#[derive(Debug, Clone)]
+pub struct L1IngotRecord {
+    /// Transaction ID on Tondi L1.
+    pub txid: [u8; 32],
+    /// Block ID where the transaction is included.
+    pub block_id: [u8; 32],
+    /// DAA score (bluescore) of the block.
+    pub daa_score: u64,
+    /// Transaction index in block.
+    pub tx_index: u32,
+    /// Output index.
+    pub output_index: u32,
+    /// Schema ID.
+    pub schema_id: [u8; 32],
+    /// Payload hash.
+    pub payload_hash: [u8; 32],
+    /// Raw payload data (optional, may be large).
+    pub payload_data: Option<Vec<u8>>,
+    /// Instance ID (unique identifier for oUTXO).
+    pub instance_id: [u8; 32],
+    /// Whether this output has been spent.
+    pub is_spent: bool,
+    /// Transaction that spent this output (if spent).
+    pub spent_txid: Option<[u8; 32]>,
+    /// DAA score when spent (if spent).
+    pub spent_daa_score: Option<u64>,
+    /// Creation timestamp.
+    pub created_at: u64,
+}
+
+/// Transaction status on L1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum L1TxStatus {
+    /// Transaction not found on L1.
+    NotFound,
+    /// Transaction is in the mempool.
+    InMempool,
+    /// Transaction is included in a block.
+    Included {
+        /// Block ID.
+        block_id: [u8; 32],
+        /// DAA score of the block.
+        daa_score: u64,
+        /// Instance ID of the created Ingot.
+        instance_id: [u8; 32],
+    },
+    /// Transaction was rejected.
+    Rejected {
+        /// Rejection reason.
+        reason: String,
+    },
+}
+
+impl L1TxStatus {
+    /// Check if the transaction is confirmed.
+    pub fn is_included(&self) -> bool {
+        matches!(self, L1TxStatus::Included { .. })
+    }
+}
+
+/// Indexer statistics.
+#[derive(Debug, Clone)]
+pub struct IndexerStats {
+    /// Total indexed transactions.
+    pub total_transactions: u64,
+    /// Active (unspent) transactions.
+    pub active_transactions: u64,
+    /// Current indexed DAA score.
+    pub current_daa_score: u64,
+    /// Latest indexed block ID.
+    pub latest_block_id: [u8; 32],
+    /// Last update timestamp.
+    pub last_update: u64,
+}
+
 #[cfg(test)]
 pub mod mock {
     //! Mock implementations for testing.
@@ -187,6 +327,86 @@ pub mod mock {
                 index: 0,
                 value: 1_000_000_000, // 10 TDI
             }])
+        }
+    }
+
+    /// Mock Tondi Indexer client for testing.
+    #[derive(Default)]
+    pub struct MockTondiIndexerClient {
+        /// Indexed transactions.
+        pub indexed_txs: Arc<Mutex<Vec<L1IngotRecord>>>,
+        /// Current DAA score.
+        pub current_daa_score: Arc<Mutex<u64>>,
+        /// Transaction statuses (tx_id -> status).
+        pub tx_statuses: Arc<Mutex<std::collections::HashMap<[u8; 32], L1TxStatus>>>,
+    }
+
+    #[async_trait]
+    impl TondiIndexerClient for MockTondiIndexerClient {
+        async fn get_stats(&self) -> Result<IndexerStats> {
+            let txs = self.indexed_txs.lock().unwrap();
+            let daa_score = *self.current_daa_score.lock().unwrap();
+            Ok(IndexerStats {
+                total_transactions: txs.len() as u64,
+                active_transactions: txs.iter().filter(|t| !t.is_spent).count() as u64,
+                current_daa_score: daa_score,
+                latest_block_id: [0u8; 32],
+                last_update: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            })
+        }
+
+        async fn query_transactions(
+            &self,
+            options: IndexerQueryOptions,
+        ) -> Result<Vec<L1IngotRecord>> {
+            let txs = self.indexed_txs.lock().unwrap();
+            let filtered: Vec<L1IngotRecord> = txs
+                .iter()
+                .filter(|tx| {
+                    // Schema filter
+                    if let Some(schema_id) = &options.schema_id {
+                        if tx.schema_id != *schema_id {
+                            return false;
+                        }
+                    }
+                    // DAA score range filter
+                    if let Some(min) = options.min_daa_score {
+                        if tx.daa_score < min {
+                            return false;
+                        }
+                    }
+                    if let Some(max) = options.max_daa_score {
+                        if tx.daa_score > max {
+                            return false;
+                        }
+                    }
+                    // Spent filter
+                    if !options.include_spent && tx.is_spent {
+                        return false;
+                    }
+                    true
+                })
+                .skip(options.offset)
+                .take(options.limit)
+                .cloned()
+                .collect();
+            Ok(filtered)
+        }
+
+        async fn get_transaction(
+            &self,
+            instance_id: &[u8; 32],
+        ) -> Result<Option<L1IngotRecord>> {
+            let txs = self.indexed_txs.lock().unwrap();
+            Ok(txs.iter().find(|tx| &tx.instance_id == instance_id).cloned())
+        }
+
+        async fn get_tx_status(&self, tx_id: &[u8; 32]) -> Result<L1TxStatus> {
+            let statuses = self.tx_statuses.lock().unwrap();
+            Ok(statuses.get(tx_id).cloned().unwrap_or(L1TxStatus::NotFound))
         }
     }
 }

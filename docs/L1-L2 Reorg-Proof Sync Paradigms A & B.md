@@ -1,5 +1,9 @@
 # L1-L2 Reorg-Proof Sync Paradigms
 
+> **实现状态**: ✅ 方案 B 已实现
+> 
+> 代码位置: `crates/services/tondi-ingot-adapter/src/sync.rs`
+
 ## 方案对比
 
 ### 方案 A：VirtualChainChanged 通知监听 - 主动推送
@@ -10,7 +14,7 @@ flowchart LR
     FV -->|实时处理| D[检测 reorg + 确认追踪]
 ```
 
-### 方案 B：Ingot Indexer 查询 - 被动拉取
+### 方案 B：Ingot Indexer 查询 - 被动拉取 ✅ 已实现
 
 ```mermaid
 flowchart LR
@@ -34,12 +38,146 @@ flowchart LR
 
 ---
 
-## Indexer 方案设计
+## ✅ 已实现: Indexer 方案 (方案 B)
 
-如果使用 Indexer 方案，设计会更简洁：
+### 实现架构
+
+```mermaid
+flowchart TB
+    subgraph FuelVM[FuelVM Sovereign Rollup]
+        BP[Block Producer - PoA] --> AD[TondiIngotAdapter]
+        AD -->|BatchSubmittedEvent| SS[IndexerSyncService]
+        SS -->|SyncEvent| SM[State Manager]
+    end
+    
+    AD -->|Submit Ingot TX| TN[Tondi Node RPC]
+    SS -->|Query| TI[Tondi Indexer :18110]
+    
+    subgraph Events[Sync Events]
+        E1[BatchConfirmed]
+        E2[BatchFinalized]
+        E3[BatchOrphaned]
+        E4[ReorgDetected]
+    end
+    SS --> Events
+```
+
+### 核心组件
+
+| 组件 | 文件 | 职责 |
+|------|------|------|
+| `SyncConfig` | `config.rs` | 同步配置（轮询间隔、超时等） |
+| `TondiIndexerClient` | `ports.rs` | Indexer RPC 抽象接口 |
+| `IndexerSyncService` | `sync.rs` | 同步服务主逻辑 |
+| `ConfirmationLevel` | `sync.rs` | 确认状态枚举 |
+| `SyncEvent` | `sync.rs` | 同步事件通知 |
+
+### 实现代码
 
 ```rust
-/// 基于 Indexer 的同步服务
+// crates/services/tondi-ingot-adapter/src/config.rs
+/// L1-L2 同步配置
+pub struct SyncConfig {
+    /// Indexer RPC 地址 (默认: http://localhost:18110)
+    pub indexer_url: Url,
+    /// 轮询间隔 (默认: 3秒)
+    pub poll_interval: Duration,
+    /// 孤立批次超时 (默认: 45秒)
+    pub orphan_timeout: Duration,
+    /// 最大重试次数 (默认: 3)
+    pub max_resubmit_attempts: u8,
+    /// 最终确认数 (默认: 10 DAA score)
+    pub finality_confirmations: u64,
+    /// 是否启用同步
+    pub enabled: bool,
+}
+
+// crates/services/tondi-ingot-adapter/src/sync.rs
+/// 确认级别
+pub enum ConfirmationLevel {
+    NotFound,                           // 未找到
+    Pending,                            // 在 mempool
+    Included { daa_score, confirmations }, // 已包含，等待确认
+    Finalized { daa_score },            // 已最终确认
+    Orphaned,                           // 已孤立
+}
+
+/// 同步事件
+pub enum SyncEvent {
+    BatchConfirmed { batch_number, instance_id, daa_score },
+    BatchFinalized { batch_number, instance_id, daa_score },
+    BatchOrphaned { batch_number, tx_id, reason },
+    ReorgDetected { reorg_daa_score, affected_count },
+}
+
+/// Indexer 同步服务
+pub struct IndexerSyncService<I, D> {
+    config: SyncConfig,
+    indexer: I,                         // TondiIndexerClient 实现
+    database: Arc<D>,                   // 提交数据库
+    schema_id: [u8; 32],               // FuelVM schema ID
+    last_confirmed_daa_score: Mutex<u64>,
+    pending_batches: Mutex<HashMap<u64, SubmittedBatchTracker>>,
+}
+
+impl<I, D> IndexerSyncService<I, D> {
+    /// 同步一次迭代
+    pub async fn sync_once(&self) -> Result<Vec<SyncEvent>> {
+        // 1. 获取 Indexer 状态
+        let stats = self.indexer.get_stats().await?;
+        
+        // 2. 查询已确认的 FuelVM 批次
+        let options = IndexerQueryOptions::for_fuel_batches(
+            self.schema_id,
+            Some(self.last_confirmed_daa_score),
+        );
+        let confirmed = self.indexer.query_transactions(options).await?;
+        
+        // 3. 处理确认的批次
+        for ingot in confirmed {
+            self.process_confirmed_ingot(&ingot, stats.current_daa_score).await?;
+        }
+        
+        // 4. 检查孤立批次
+        self.check_orphaned_batches().await?
+    }
+}
+```
+
+### 使用方式
+
+```rust
+use fuel_core_tondi_ingot_adapter::{
+    Config, SyncConfig, new_service_with_sync,
+};
+
+// 创建带同步的服务
+let config = Config::new(rpc_url)
+    .with_sync(SyncConfig {
+        indexer_url: "http://localhost:18110".parse()?,
+        poll_interval: Duration::from_secs(3),
+        orphan_timeout: Duration::from_secs(45),
+        finality_confirmations: 10,
+        ..Default::default()
+    });
+
+let service = new_service_with_sync(
+    config,
+    rpc_client,
+    signer,
+    Arc::new(database),
+    indexer_client,
+)?;
+```
+
+---
+
+## 原设计参考
+
+以下是原始设计文档，供参考：
+
+```rust
+/// 基于 Indexer 的同步服务 (原设计)
 pub struct TondiIndexerSync {
     /// Tondi RPC 客户端
     tondi_rpc: TondiRpcClient,
@@ -132,36 +270,40 @@ flowchart TB
 
 ---
 
-## 推荐方案
+## ✅ 推荐方案 (已实现)
 
-对于 **MVP 阶段**，建议使用 **Indexer 方案**，因为：
+对于 **MVP 阶段**，使用 **Indexer 方案**，因为：
 
 1. **实现简单**：只需 HTTP 查询，无需维护 WebSocket 连接
 2. **恢复容易**：节点重启后直接从 Indexer 同步
 3. **调试方便**：可以手动查询 Indexer 验证状态
 4. **依赖少**：不需要 Tondi 的通知订阅功能
 
-```rust
-// MVP 配置
-pub struct TondiSyncConfig {
-    /// 轮询间隔 - 建议 2-6 秒
-    pub poll_interval: Duration,
-    /// 认为批次孤立的超时时间 - 建议 30-60 秒
-    pub orphan_timeout: Duration,
-    /// 最大重试次数
-    pub max_resubmit_attempts: u8,
-}
+### 默认配置值
 
-impl Default for TondiSyncConfig {
-    fn default() -> Self {
-        Self {
-            poll_interval: Duration::from_secs(3),
-            orphan_timeout: Duration::from_secs(45),
-            max_resubmit_attempts: 3,
-        }
-    }
+```rust
+// crates/services/tondi-ingot-adapter/src/config.rs
+impl SyncConfig {
+    /// 默认轮询间隔 (3秒)
+    pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(3);
+    /// 默认孤立超时 (45秒)
+    pub const DEFAULT_ORPHAN_TIMEOUT: Duration = Duration::from_secs(45);
+    /// 默认最大重试次数 (3次)
+    pub const DEFAULT_MAX_RESUBMIT_ATTEMPTS: u8 = 3;
+    /// 默认最终确认数 (10 DAA score)
+    pub const DEFAULT_FINALITY_CONFIRMATIONS: u64 = 10;
 }
 ```
+
+### 配置说明
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `poll_interval` | 3s | 轮询 Indexer 的间隔，建议 2-6 秒 |
+| `orphan_timeout` | 45s | 认为批次孤立的超时时间，建议 30-60 秒 |
+| `max_resubmit_attempts` | 3 | 最大重试次数 |
+| `finality_confirmations` | 10 | 认为已最终确认的 DAA score 差值 |
+| `indexer_url` | localhost:18110 | Tondi Indexer RPC 地址 |
 
 ---
 
@@ -285,17 +427,30 @@ pub trait L1Connector: Send + Sync {
 
 ## 三阶段演进计划
 
-### Phase 1: Pure Sovereign - 当前实现
+### Phase 1: Pure Sovereign - ✅ 已实现
 
 ```mermaid
 flowchart LR
     U[User TX] --> MP[Mempool - L2排序]
     MP --> POA[PoA Block Producer]
-    POA --> SUB[Submit to L1]
+    POA --> AD[TondiIngotAdapter]
+    AD --> SUB[Submit to L1]
+    AD <-->|Sync| IX[Indexer]
 ```
 
-**实现**: TondiIngotAdapter - 推送模式  
-**功能**: 批量提交、确认追踪、reorg 处理
+**实现文件**:
+- `adapter.rs` - 批次提交逻辑
+- `sync.rs` - L1 确认同步 (Plan B)
+- `service.rs` - 后台服务
+
+**功能**:
+- ✅ 批量提交 FuelVM 区块到 Tondi L1
+- ✅ TLV 格式的 Ingot payload 编码
+- ✅ Indexer 轮询确认追踪
+- ✅ 孤立批次检测和重提交调度
+- ✅ DAA score 确认计数
+- ⚠️ Reorg 检测 (基础实现)
+- ⚠️ 实际重提交 (需要 Block Producer 配合)
 
 ### Phase 2: Hybrid Mode - 过渡阶段
 
@@ -425,29 +580,45 @@ fuel-core run \
 
 ---
 
-## 文件结构演进
+## 文件结构
+
+### 当前实现 (Phase 1)
+
+```
+crates/services/tondi-ingot-adapter/src/
+├── lib.rs          # 模块导出
+├── config.rs       # Config + SyncConfig 配置
+├── adapter.rs      # TondiIngotAdapter 批次提交
+├── sync.rs         # IndexerSyncService 确认同步 ✅
+├── service.rs      # 后台服务 (RunnableService)
+├── payload.rs      # TLV payload 编码
+├── ports.rs        # 接口 traits (TondiRpcClient, TondiIndexerClient)
+├── types.rs        # 类型定义 (BatchRecord, BatchL1Status)
+├── storage.rs      # 提交数据库
+└── error.rs        # 错误类型
+```
+
+### 未来扩展 (Phase 2/3)
 
 ```mermaid
 flowchart TB
     subgraph Crate[tondi-ingot-adapter/src]
         LIB[lib.rs]
         CFG[config.rs - 统一配置]
-        CON[connector.rs - L1Connector实现]
         
-        subgraph SOV[sovereign/ - Phase 1]
-            S1[mod.rs]
+        subgraph Current[当前 - Phase 1 ✅]
             S2[adapter.rs - 批次提交]
-            S3[sync.rs - 确认同步]
+            S3[sync.rs - Indexer 同步]
             S4[service.rs - 后台服务]
         end
         
-        subgraph INB[inbox/ - Phase 2+]
+        subgraph INB[inbox/ - Phase 2+ 🔮]
             I1[mod.rs]
             I2[sync.rs - L1交易拉取]
             I3[priority.rs - 优先级队列]
         end
         
-        subgraph BAS[based/ - Phase 3]
+        subgraph BAS[based/ - Phase 3 🔮]
             B1[mod.rs]
             B2[derivation.rs - 区块派生]
             B3[ordering.rs - L1排序证明]
@@ -459,14 +630,27 @@ flowchart TB
 
 ## 总结
 
-| 阶段 | 模式 | 主要实现 | 切换方式 |
+| 阶段 | 模式 | 主要实现 | 状态 |
 |----|----|----|----|
-| **Phase 1** | Sovereign | TondiIngotAdapter 推送批次 | 当前 |
-| **Phase 2** | Hybrid | 新增 L1InboxSync 拉取 + 优先级 | 配置切换 |
-| **Phase 3** | Based | 新增 DerivationPipeline | 配置切换 |
+| **Phase 1** | Sovereign | TondiIngotAdapter + IndexerSyncService | ✅ 已实现 |
+| **Phase 2** | Hybrid | 新增 L1InboxSync 拉取 + 优先级 | 🔮 计划中 |
+| **Phase 3** | Based | 新增 DerivationPipeline | 🔮 计划中 |
+
+### Phase 1 实现清单
+
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| 批次提交 | ✅ | `TondiIngotAdapter.submit_batch()` |
+| TLV payload | ✅ | `PayloadBuilder.encode_tlv()` |
+| Indexer 轮询 | ✅ | `IndexerSyncService.sync_once()` |
+| 确认追踪 | ✅ | `ConfirmationLevel` 状态机 |
+| 孤立检测 | ✅ | `check_orphaned_batches()` |
+| 事件通知 | ✅ | `SyncEvent` 枚举 |
+| 重提交调度 | ⚠️ | 需要 Block Producer 配合 |
 
 **关键设计原则**：
 
-1. **接口抽象**：L1Connector 和 OrderingProvider 隔离模式差异
-2. **配置驱动**：通过配置切换模式，无需代码改动
+1. **接口抽象**：`TondiIndexerClient` 和 `TondiRpcClient` 隔离 L1 交互
+2. **配置驱动**：`SyncConfig` 控制同步行为，无需代码改动
 3. **增量实现**：Phase 1 完成后，Phase 2/3 是增量添加
+4. **事件驱动**：`SyncEvent` 允许上层服务响应状态变化

@@ -1,11 +1,29 @@
-//! Background service for Tondi block submission.
+//! Background service for Tondi block submission and L1 sync.
 //!
 //! This module implements the `RunnableService` trait for the Tondi adapter,
-//! enabling it to run as a background task that processes blocks and submits
-//! batches to Tondi L1.
+//! enabling it to run as a background task that:
+//! 1. Processes blocks and submits batches to Tondi L1
+//! 2. Polls the Tondi Indexer for confirmation status (Plan B approach)
+//! 3. Handles reorg detection and batch resubmission
+//!
+//! ## Architecture
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                    TondiIngotService                            │
+//! │  ┌──────────────────────────┐  ┌─────────────────────────────┐  │
+//! │  │  Submission Task         │  │  Sync Task                  │  │
+//! │  │  - Queue blocks          │  │  - Poll indexer             │  │
+//! │  │  - Build & submit batches│  │  - Track confirmations      │  │
+//! │  │  - Store records         │  │  - Detect reorgs            │  │
+//! │  └──────────────────────────┘  └─────────────────────────────┘  │
+//! │              │                              ↑                    │
+//! │              └──── submission_tx ───────────┘                    │
+//! └─────────────────────────────────────────────────────────────────┘
+//! ```
 
 use crate::{
-    adapter::TondiIngotAdapter,
+    adapter::{BatchSubmittedEvent, TondiIngotAdapter},
     config::Config,
     error::{
         Result,
@@ -13,9 +31,11 @@ use crate::{
     },
     ports::{
         Signer,
+        TondiIndexerClient,
         TondiRpcClient,
         TondiSubmissionDatabase,
     },
+    sync::{IndexerSyncService, SyncEvent},
 };
 use async_trait::async_trait;
 use fuel_core_services::{
@@ -32,22 +52,42 @@ use tokio::sync::{
     watch,
 };
 
-/// Submission sync state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Submission and sync state.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncState {
-    /// Adapter is running and submitting batches.
+    /// Service is running and submitting batches.
     Running {
         /// Last submitted batch number.
         last_batch: u64,
+        /// Number of batches pending L1 confirmation.
+        pending_confirmations: usize,
     },
-    /// Adapter is idle (no pending blocks).
+    /// Service is idle (no pending blocks).
     Idle,
-    /// Adapter encountered an error.
-    Error,
+    /// Service encountered an error.
+    Error {
+        /// Error message.
+        message: String,
+    },
+    /// Service is syncing with L1.
+    Syncing {
+        /// Current L1 DAA score.
+        l1_daa_score: u64,
+    },
 }
 
-/// Type alias for the service.
+impl SyncState {
+    /// Check if the service is running.
+    pub fn is_running(&self) -> bool {
+        matches!(self, SyncState::Running { .. } | SyncState::Syncing { .. })
+    }
+}
+
+/// Type alias for the service (without indexer).
 pub type Service<R, S, D> = ServiceRunner<NotInitializedTask<R, S, D>>;
+
+/// Type alias for the service with sync (with indexer).
+pub type ServiceWithSync<R, S, D, I> = ServiceRunner<NotInitializedTaskWithSync<R, S, D, I>>;
 
 /// Shared state exposed by the service.
 #[derive(Clone)]
@@ -56,6 +96,8 @@ pub struct SharedState {
     block_sender: mpsc::Sender<SealedBlock>,
     /// Current sync state.
     sync_state: watch::Receiver<SyncState>,
+    /// Whether sync is enabled.
+    sync_enabled: bool,
 }
 
 impl SharedState {
@@ -69,7 +111,7 @@ impl SharedState {
 
     /// Get the current sync state.
     pub fn sync_state(&self) -> SyncState {
-        *self.sync_state.borrow()
+        self.sync_state.borrow().clone()
     }
 
     /// Wait for a state change.
@@ -78,7 +120,12 @@ impl SharedState {
             .changed()
             .await
             .map_err(|_| TondiAdapterError::Shutdown)?;
-        Ok(*self.sync_state.borrow())
+        Ok(self.sync_state.borrow().clone())
+    }
+
+    /// Check if sync is enabled.
+    pub fn sync_enabled(&self) -> bool {
+        self.sync_enabled
     }
 }
 
@@ -131,6 +178,139 @@ where
     }
 }
 
+/// Not-initialized task with sync service (Plan B: Indexer polling).
+pub struct NotInitializedTaskWithSync<R, S, D, I>
+where
+    R: TondiRpcClient,
+    S: Signer,
+    D: TondiSubmissionDatabase,
+    I: TondiIndexerClient,
+{
+    config: Config,
+    adapter: Arc<TondiIngotAdapter<R, S, ArcDatabase<D>>>,
+    sync_service: Arc<IndexerSyncService<I, D>>,
+    #[allow(dead_code)]
+    database: Arc<D>,
+    block_receiver: mpsc::Receiver<SealedBlock>,
+    block_sender: mpsc::Sender<SealedBlock>,
+    submission_rx: mpsc::Receiver<BatchSubmittedEvent>,
+    sync_state_tx: watch::Sender<SyncState>,
+    sync_state_rx: watch::Receiver<SyncState>,
+    sync_event_tx: mpsc::Sender<SyncEvent>,
+    #[allow(dead_code)]
+    sync_event_rx: mpsc::Receiver<SyncEvent>,
+}
+
+impl<R, S, D, I> NotInitializedTaskWithSync<R, S, D, I>
+where
+    R: TondiRpcClient + 'static,
+    S: Signer + 'static,
+    D: TondiSubmissionDatabase + 'static,
+    I: TondiIndexerClient + 'static,
+{
+    /// Create a new not-initialized task with sync service.
+    ///
+    /// Note: The database is wrapped in an Arc for sharing between
+    /// the adapter and sync service.
+    pub fn new_with_arc_database(
+        config: Config,
+        rpc_client: R,
+        signer: S,
+        database: Arc<D>,
+        indexer: I,
+    ) -> Result<Self> {
+        // Create submission notification channel
+        let (submission_tx, submission_rx) = mpsc::channel(100);
+
+        // Create adapter - we need to create a new wrapper database
+        // that forwards to the Arc<D>
+        let adapter_db = ArcDatabase {
+            inner: database.clone(),
+        };
+        let adapter = TondiIngotAdapter::new(
+            config.clone(),
+            rpc_client,
+            signer,
+            adapter_db,
+        )?.with_submission_channel(submission_tx);
+
+        // Create sync service
+        let schema_id = adapter.schema_id_bytes();
+        let sync_service = IndexerSyncService::new(
+            config.sync.clone(),
+            indexer,
+            database.clone(),
+            schema_id,
+        );
+
+        let (block_sender, block_receiver) = mpsc::channel(100);
+        let (sync_state_tx, sync_state_rx) = watch::channel(SyncState::Idle);
+        let (sync_event_tx, sync_event_rx) = mpsc::channel(100);
+
+        Ok(Self {
+            config,
+            adapter: Arc::new(adapter),
+            sync_service: Arc::new(sync_service),
+            database,
+            block_receiver,
+            block_sender,
+            submission_rx,
+            sync_state_tx,
+            sync_state_rx,
+            sync_event_tx,
+            sync_event_rx,
+        })
+    }
+}
+
+/// Wrapper to allow using Arc<D> as TondiSubmissionDatabase.
+struct ArcDatabase<D>
+where
+    D: TondiSubmissionDatabase,
+{
+    inner: Arc<D>,
+}
+
+impl<D> TondiSubmissionDatabase for ArcDatabase<D>
+where
+    D: TondiSubmissionDatabase,
+{
+    fn get_last_batch_number(&self) -> Result<Option<u64>> {
+        self.inner.get_last_batch_number()
+    }
+
+    fn get_last_instance_id(&self) -> Result<Option<[u8; 32]>> {
+        self.inner.get_last_instance_id()
+    }
+
+    fn store_batch(&self, record: &crate::types::BatchRecord) -> Result<()> {
+        self.inner.store_batch(record)
+    }
+
+    fn get_batch(&self, batch_number: u64) -> Result<Option<crate::types::BatchRecord>> {
+        self.inner.get_batch(batch_number)
+    }
+
+    fn get_batches_by_status(
+        &self,
+        status: crate::types::SubmissionStatus,
+    ) -> Result<Vec<crate::types::BatchRecord>> {
+        self.inner.get_batches_by_status(status)
+    }
+
+    fn update_batch(&self, record: &crate::types::BatchRecord) -> Result<()> {
+        self.inner.update_batch(record)
+    }
+
+    fn get_submitted_height(&self) -> Result<Option<fuel_core_types::fuel_types::BlockHeight>> {
+        self.inner.get_submitted_height()
+    }
+
+    fn set_submitted_height(&self, height: fuel_core_types::fuel_types::BlockHeight) -> Result<()> {
+        self.inner.set_submitted_height(height)
+    }
+}
+
 /// Running task for the Tondi adapter service.
 pub struct Task<R, S, D>
 where
@@ -142,6 +322,24 @@ where
     adapter: Arc<TondiIngotAdapter<R, S, D>>,
     block_receiver: mpsc::Receiver<SealedBlock>,
     sync_state_tx: watch::Sender<SyncState>,
+    shutdown: StateWatcher,
+}
+
+/// Running task with sync service (Plan B: Indexer polling).
+pub struct TaskWithSync<R, S, D, I>
+where
+    R: TondiRpcClient,
+    S: Signer,
+    D: TondiSubmissionDatabase,
+    I: TondiIndexerClient,
+{
+    config: Config,
+    adapter: Arc<TondiIngotAdapter<R, S, ArcDatabase<D>>>,
+    sync_service: Arc<IndexerSyncService<I, D>>,
+    block_receiver: mpsc::Receiver<SealedBlock>,
+    submission_rx: mpsc::Receiver<BatchSubmittedEvent>,
+    sync_state_tx: watch::Sender<SyncState>,
+    sync_event_tx: mpsc::Sender<SyncEvent>,
     shutdown: StateWatcher,
 }
 
@@ -162,6 +360,7 @@ where
         SharedState {
             block_sender: self.block_sender.clone(),
             sync_state: self.sync_state_rx.clone(),
+            sync_enabled: false,
         }
     }
 
@@ -175,6 +374,47 @@ where
             adapter: self.adapter,
             block_receiver: self.block_receiver,
             sync_state_tx: self.sync_state_tx,
+            shutdown: watcher.clone(),
+        };
+        Ok(task)
+    }
+}
+
+#[async_trait]
+impl<R, S, D, I> RunnableService for NotInitializedTaskWithSync<R, S, D, I>
+where
+    R: TondiRpcClient + 'static,
+    S: Signer + 'static,
+    D: TondiSubmissionDatabase + 'static,
+    I: TondiIndexerClient + 'static,
+{
+    const NAME: &'static str = "TondiIngotAdapterWithSync";
+
+    type SharedData = SharedState;
+    type Task = TaskWithSync<R, S, D, I>;
+    type TaskParams = ();
+
+    fn shared_data(&self) -> Self::SharedData {
+        SharedState {
+            block_sender: self.block_sender.clone(),
+            sync_state: self.sync_state_rx.clone(),
+            sync_enabled: self.config.sync.enabled,
+        }
+    }
+
+    async fn into_task(
+        self,
+        watcher: &StateWatcher,
+        _params: Self::TaskParams,
+    ) -> anyhow::Result<Self::Task> {
+        let task = TaskWithSync {
+            config: self.config,
+            adapter: self.adapter,
+            sync_service: self.sync_service,
+            block_receiver: self.block_receiver,
+            submission_rx: self.submission_rx,
+            sync_state_tx: self.sync_state_tx,
+            sync_event_tx: self.sync_event_tx,
             shutdown: watcher.clone(),
         };
         Ok(task)
@@ -212,7 +452,7 @@ where
                 Some(block) = self.block_receiver.recv() => {
                     if let Err(e) = self.adapter.queue_block(block).await {
                         tracing::error!(error = %e, "Failed to queue block");
-                        self.update_state(SyncState::Error);
+                        self.update_state(SyncState::Error { message: e.to_string() });
                         TaskNextAction::ErrorContinue(e.into())
                     } else {
                         TaskNextAction::Continue
@@ -226,7 +466,7 @@ where
                     if pending_count >= self.config.min_batch_size as usize {
                         if let Err(e) = self.adapter.submit_batch().await {
                             tracing::error!(error = %e, "Failed to submit batch");
-                            self.update_state(SyncState::Error);
+                            self.update_state(SyncState::Error { message: e.to_string() });
                             // Continue trying
                         }
                     }
@@ -239,11 +479,112 @@ where
                     // Update state
                     let pending = self.adapter.pending_block_count().await;
                     if pending > 0 {
-                        self.update_state(SyncState::Running { last_batch: 0 });
+                        self.update_state(SyncState::Running { last_batch: 0, pending_confirmations: 0 });
                     } else {
                         self.update_state(SyncState::Idle);
                     }
 
+                    TaskNextAction::Continue
+                }
+            }
+        }
+    }
+
+    fn shutdown(self) -> impl core::future::Future<Output = anyhow::Result<()>> + Send {
+        async move {
+            // Flush any remaining blocks
+            self.adapter.flush().await.map_err(anyhow::Error::from)
+        }
+    }
+}
+
+impl<R, S, D, I> RunnableTask for TaskWithSync<R, S, D, I>
+where
+    R: TondiRpcClient + 'static,
+    S: Signer + 'static,
+    D: TondiSubmissionDatabase + 'static,
+    I: TondiIndexerClient + 'static,
+{
+    fn run(
+        &mut self,
+        _watcher: &mut StateWatcher,
+    ) -> impl core::future::Future<Output = TaskNextAction> + Send {
+        let submission_interval = self.config.submission_interval;
+        let sync_poll_interval = self.config.sync.poll_interval;
+
+        async move {
+            let mut submission_interval = tokio::time::interval(submission_interval);
+            let mut sync_interval = tokio::time::interval(sync_poll_interval);
+
+            tokio::select! {
+                biased;
+
+                // Check for shutdown
+                _ = self.shutdown.while_started() => {
+                    // Flush pending blocks before shutdown
+                    if let Err(e) = self.adapter.flush().await {
+                        tracing::error!(error = %e, "Failed to flush pending blocks on shutdown");
+                    }
+                    TaskNextAction::Stop
+                }
+
+                // Receive new blocks
+                Some(block) = self.block_receiver.recv() => {
+                    if let Err(e) = self.adapter.queue_block(block).await {
+                        tracing::error!(error = %e, "Failed to queue block");
+                        self.update_state(SyncState::Error { message: e.to_string() });
+                        TaskNextAction::ErrorContinue(e.into())
+                    } else {
+                        TaskNextAction::Continue
+                    }
+                }
+
+                // Receive submission notifications
+                Some(event) = self.submission_rx.recv() => {
+                    // Track submission in sync service
+                    self.sync_service.track_submission(event.batch_number, event.tx_id).await;
+                    TaskNextAction::Continue
+                }
+
+                // Periodic submission check
+                _ = submission_interval.tick() => {
+                    // Check if we should submit
+                    let pending_count = self.adapter.pending_block_count().await;
+                    if pending_count >= self.config.min_batch_size as usize {
+                        if let Err(e) = self.adapter.submit_batch().await {
+                            tracing::error!(error = %e, "Failed to submit batch");
+                            self.update_state(SyncState::Error { message: e.to_string() });
+                        }
+                    }
+                    TaskNextAction::Continue
+                }
+
+                // Periodic sync check (Plan B: Indexer polling)
+                _ = sync_interval.tick() => {
+                    if self.config.sync.enabled {
+                        match self.sync_service.sync_once().await {
+                            Ok(events) => {
+                                // Forward sync events
+                                for event in events {
+                                    let _ = self.sync_event_tx.try_send(event);
+                                }
+
+                                // Update state
+                                let pending = self.sync_service.pending_count().await;
+                                if pending > 0 {
+                                    self.update_state(SyncState::Running {
+                                        last_batch: 0,
+                                        pending_confirmations: pending,
+                                    });
+                                } else {
+                                    self.update_state(SyncState::Idle);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Failed to sync with indexer");
+                            }
+                        }
+                    }
                     TaskNextAction::Continue
                 }
             }
@@ -269,7 +610,19 @@ where
     }
 }
 
-/// Create a new Tondi adapter service.
+impl<R, S, D, I> TaskWithSync<R, S, D, I>
+where
+    R: TondiRpcClient,
+    S: Signer,
+    D: TondiSubmissionDatabase,
+    I: TondiIndexerClient,
+{
+    fn update_state(&self, state: SyncState) {
+        let _ = self.sync_state_tx.send(state);
+    }
+}
+
+/// Create a new Tondi adapter service (without sync).
 pub fn new_service<R, S, D>(
     config: Config,
     rpc_client: R,
@@ -285,6 +638,39 @@ where
     Ok(ServiceRunner::new(task))
 }
 
+/// Create a new Tondi adapter service with L1 sync (Plan B: Indexer polling).
+///
+/// This service includes:
+/// - Block submission to Tondi L1
+/// - Confirmation tracking via Indexer polling
+/// - Reorg detection and handling
+/// - Automatic resubmission of orphaned batches
+///
+/// Note: The database is wrapped in an Arc for sharing between the adapter
+/// and sync service.
+pub fn new_service_with_sync<R, S, D, I>(
+    config: Config,
+    rpc_client: R,
+    signer: S,
+    database: Arc<D>,
+    indexer: I,
+) -> anyhow::Result<ServiceWithSync<R, S, D, I>>
+where
+    R: TondiRpcClient + 'static,
+    S: Signer + 'static,
+    D: TondiSubmissionDatabase + 'static,
+    I: TondiIndexerClient + 'static,
+{
+    let task = NotInitializedTaskWithSync::new_with_arc_database(
+        config,
+        rpc_client,
+        signer,
+        database,
+        indexer,
+    )?;
+    Ok(ServiceRunner::new(task))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,12 +680,26 @@ mod tests {
     fn test_sync_state() {
         let state = SyncState::Idle;
         assert_eq!(state, SyncState::Idle);
+        assert!(!state.is_running());
 
-        let state = SyncState::Running { last_batch: 5 };
+        let state = SyncState::Running {
+            last_batch: 5,
+            pending_confirmations: 2,
+        };
         match state {
-            SyncState::Running { last_batch } => assert_eq!(last_batch, 5),
+            SyncState::Running { last_batch, pending_confirmations } => {
+                assert_eq!(last_batch, 5);
+                assert_eq!(pending_confirmations, 2);
+            }
             _ => panic!("Expected Running state"),
         }
+        assert!(state.is_running());
+
+        let state = SyncState::Syncing { l1_daa_score: 100 };
+        assert!(state.is_running());
+
+        let state = SyncState::Error { message: "test".to_string() };
+        assert!(!state.is_running());
     }
 }
 

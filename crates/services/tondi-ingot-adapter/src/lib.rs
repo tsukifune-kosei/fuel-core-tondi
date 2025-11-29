@@ -50,10 +50,11 @@ mod payload;
 pub mod ports;
 mod service;
 mod storage;
+mod sync;
 mod types;
 
-pub use adapter::TondiIngotAdapter;
-pub use config::Config;
+pub use adapter::{BatchSubmittedEvent, TondiIngotAdapter};
+pub use config::{Config, SyncConfig};
 pub use error::TondiAdapterError;
 pub use payload::{
     FuelBlockBatchPayload,
@@ -62,15 +63,20 @@ pub use payload::{
 };
 pub use service::{
     new_service,
+    new_service_with_sync,
     Service,
+    ServiceWithSync,
     SharedState,
     SyncState,
 };
 pub use storage::TondiSubmissionDb;
+pub use sync::{ConfirmationLevel, IndexerSyncService, SyncEvent};
 pub use types::{
     BatchCommitment,
     BatchInfo,
+    BatchL1Status,
     BatchRecord,
+    PendingBatch,
     SubmissionStatus,
 };
 

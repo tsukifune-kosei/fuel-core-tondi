@@ -2,6 +2,13 @@
 //!
 //! This module contains the main adapter logic for batching and submitting
 //! FuelVM blocks to Tondi L1.
+//!
+//! ## Integration with Sync Service
+//!
+//! The adapter works with the `IndexerSyncService` for confirmation tracking:
+//! 1. Adapter submits batches and notifies the sync service
+//! 2. Sync service polls the indexer for confirmation status
+//! 3. Sync service handles reorg detection and resubmission scheduling
 
 use crate::{
     config::Config,
@@ -22,7 +29,7 @@ use crate::{
 };
 use fuel_core_types::blockchain::SealedBlock;
 use std::time::Instant;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tondi_consensus_core::tx::ingot::{
     create_ingot_output,
     IngotFlags,
@@ -31,6 +38,15 @@ use tondi_consensus_core::tx::ingot::{
     SignatureType,
 };
 use tondi_hashes::Hash;
+
+/// Event sent to the sync service when a batch is submitted.
+#[derive(Debug, Clone)]
+pub struct BatchSubmittedEvent {
+    /// Batch number.
+    pub batch_number: u64,
+    /// Transaction ID on L1.
+    pub tx_id: [u8; 32],
+}
 
 /// Tondi Ingot Adapter for submitting FuelVM blocks to L1.
 pub struct TondiIngotAdapter<R, S, D>
@@ -51,6 +67,8 @@ where
     batch_counter: Mutex<u64>,
     /// Last confirmed instance ID (for parent_ref).
     last_instance_id: Mutex<Option<[u8; 32]>>,
+    /// Channel to notify sync service about submissions.
+    submission_tx: Option<mpsc::Sender<BatchSubmittedEvent>>,
 }
 
 impl<R, S, D> TondiIngotAdapter<R, S, D>
@@ -74,7 +92,24 @@ where
             last_submission: Mutex::new(Instant::now()),
             batch_counter: Mutex::new(batch_counter),
             last_instance_id: Mutex::new(last_instance_id),
+            submission_tx: None,
         })
+    }
+
+    /// Set the submission notification channel.
+    ///
+    /// This channel is used to notify the sync service when batches are submitted.
+    pub fn with_submission_channel(
+        mut self,
+        tx: mpsc::Sender<BatchSubmittedEvent>,
+    ) -> Self {
+        self.submission_tx = Some(tx);
+        self
+    }
+
+    /// Get the schema ID bytes.
+    pub fn schema_id_bytes(&self) -> [u8; 32] {
+        self.config.schema_id_bytes()
     }
 
     /// Queue a block for submission.
@@ -170,9 +205,19 @@ where
         let tx_id = self.rpc_client.submit_transaction(tx_bytes).await?;
 
         // Create and store batch record
-        let mut record = BatchRecord::new_pending(payload.batch_info, payload.commitment);
+        let mut record = BatchRecord::new_pending(payload.batch_info.clone(), payload.commitment);
         record.mark_submitted(tx_id, parent_ref);
         self.database.store_batch(&record)?;
+
+        // Notify sync service about the submission
+        if let Some(ref tx) = self.submission_tx {
+            let event = BatchSubmittedEvent {
+                batch_number,
+                tx_id,
+            };
+            // Non-blocking send - if channel is full, we'll track via database anyway
+            let _ = tx.try_send(event);
+        }
 
         // Update submission time
         *self.last_submission.lock().await = Instant::now();
@@ -189,7 +234,53 @@ where
         Ok(())
     }
 
+    /// Get batches that need resubmission.
+    pub fn get_failed_batches(&self) -> Result<Vec<BatchRecord>> {
+        self.database.get_batches_by_status(SubmissionStatus::Failed)
+    }
+
+    /// Mark a batch as needing resubmission.
+    ///
+    /// Note: Actual resubmission requires the original block data, which is not
+    /// stored in the current implementation. The sync service should detect
+    /// orphaned batches and trigger block producer to requeue those blocks.
+    ///
+    /// For now, this validates the batch exists and is in a resubmittable state.
+    pub async fn mark_for_resubmission(&self, batch_number: u64) -> Result<()> {
+        let record = self.database.get_batch(batch_number)?
+            .ok_or_else(|| TondiAdapterError::Storage(
+                format!("Batch {} not found", batch_number)
+            ))?;
+
+        if record.status != SubmissionStatus::Failed
+            && record.status != SubmissionStatus::Submitted
+        {
+            return Err(TondiAdapterError::InvalidBlockData(format!(
+                "Batch {} is in {:?} status, cannot resubmit",
+                batch_number, record.status
+            )));
+        }
+
+        tracing::warn!(
+            batch_number,
+            start_height = %record.info.start_height,
+            end_height = %record.info.end_height,
+            "Batch marked for resubmission - blocks need to be requeued from block producer"
+        );
+
+        // TODO: Implement block requeuing from block producer
+        // The block producer should maintain a record of blocks that have been
+        // submitted but not yet confirmed, and requeue them on orphan detection.
+
+        Ok(())
+    }
+
     /// Build an Ingot transaction.
+    ///
+    /// # Arguments
+    /// * `ingot_output` - The Ingot output to include in the transaction
+    /// * `payload` - The payload data to include in the witness
+    /// * `_is_genesis` - Whether this is the genesis batch (unused currently)
     async fn build_ingot_transaction(
         &self,
         ingot_output: IngotOutput,
@@ -218,11 +309,12 @@ where
         // Use first UTXO for funding
         let funding_utxo = &utxos[0];
 
-        // Create Ingot output
-        let ingot_tx_output = create_ingot_output(100_000, ingot_output)
+        // Create Ingot output with configurable value
+        let ingot_value = Config::DEFAULT_INGOT_OUTPUT_VALUE;
+        let ingot_tx_output = create_ingot_output(ingot_value, ingot_output.clone())
             .map_err(|e| TondiAdapterError::PayloadBuild(e.to_string()))?;
 
-        // Create funding input
+        // Create funding input (unsigned)
         let funding_input = TransactionInput {
             previous_outpoint: TransactionOutpoint::new(
                 Hash::from_bytes(funding_utxo.tx_id),
@@ -233,19 +325,11 @@ where
             sig_op_count: 1,
         };
 
-        // Create witness with payload
-        let witness = IngotWitness {
-            payload: Some(payload),
-            auth_sigs: vec![],
-            script_reveal: None,
-            mast_proof: None,
-        };
-
-        // Build transaction (without signatures first for signing)
-        let tx = Transaction::new(
+        // Build unsigned transaction for sighash computation
+        let unsigned_tx = Transaction::new(
             1, // version
-            vec![funding_input],
-            vec![ingot_tx_output],
+            vec![funding_input.clone()],
+            vec![ingot_tx_output.clone()],
             0, // locktime
             SUBNETWORK_ID_NATIVE,
             0, // gas
@@ -253,25 +337,27 @@ where
         );
 
         // Compute sighash and sign
-        // NOTE: In production, use proper sighash computation from tondi_consensus_core
-        let tx_bytes = borsh::to_vec(&tx)
+        // TODO: Use proper sighash computation from tondi_consensus_core::tx::sign
+        // For now, we hash the serialized transaction as a placeholder
+        let tx_bytes = borsh::to_vec(&unsigned_tx)
             .map_err(|e| TondiAdapterError::Serialization(e.to_string()))?;
         let sighash = blake3::hash(&tx_bytes);
 
         let signature = self.signer.sign(sighash.as_bytes()).await?;
 
-        // Create witness with signature
+        // Create witness with payload and signature
         let witness_with_sig = IngotWitness {
-            payload: witness.payload,
+            payload: Some(payload),
             auth_sigs: vec![signature],
             script_reveal: None,
             mast_proof: None,
         };
 
-        // Update input with signed witness
+        // Create signature script from witness
         let witness_script = create_ingot_signature_script(&witness_with_sig)
             .map_err(|e| TondiAdapterError::Signing(e.to_string()))?;
 
+        // Create signed input
         let signed_input = TransactionInput {
             previous_outpoint: TransactionOutpoint::new(
                 Hash::from_bytes(funding_utxo.tx_id),
@@ -282,22 +368,14 @@ where
             sig_op_count: 1,
         };
 
-        // Build final signed transaction
+        // Build final signed transaction with the original ingot_output
         let signed_tx = Transaction::new(
-            1,
+            1, // version
             vec![signed_input],
-            vec![create_ingot_output(100_000, IngotOutput::new(
-                Hash::from_bytes(self.config.schema_id_bytes()),
-                Hash::from_bytes(*blake3::hash(&[]).as_bytes()),
-                IngotFlags::new(),
-                Lock::PubKey {
-                    pubkey: self.signer.public_key(),
-                    sig_type: SignatureType::CopperootSchnorr,
-                },
-            )).map_err(|e| TondiAdapterError::PayloadBuild(e.to_string()))?],
-            0,
+            vec![ingot_tx_output], // Use the original output, not a new one
+            0, // locktime
             SUBNETWORK_ID_NATIVE,
-            0,
+            0, // gas
             vec![],
         );
 
