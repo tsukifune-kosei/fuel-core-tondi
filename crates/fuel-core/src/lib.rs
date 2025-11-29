@@ -31,6 +31,9 @@ pub use fuel_core_relayer as relayer;
 #[cfg(feature = "p2p")]
 #[doc(no_inline)]
 pub use fuel_core_sync as sync;
+#[cfg(feature = "tondi")]
+#[doc(no_inline)]
+pub use fuel_core_tondi_ingot_adapter as tondi;
 #[doc(no_inline)]
 pub use fuel_core_tx_status_manager as tx_status_manager;
 #[doc(no_inline)]

@@ -274,8 +274,7 @@ impl OffChainDatabase for OffChainIterableKeyValueView {
         owner: &Address,
         asset_id: &AssetId,
     ) -> CoinsToSpendIndexIter<'_> {
-        let prefix: Vec<_> = NON_RETRYABLE_BYTE
-            .as_ref()
+        let prefix: Vec<_> = <[u8; 1] as AsRef<[u8]>>::as_ref(&NON_RETRYABLE_BYTE)
             .iter()
             .copied()
             .chain(owner.iter().copied())

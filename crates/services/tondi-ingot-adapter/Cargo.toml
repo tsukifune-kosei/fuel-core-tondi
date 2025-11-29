@@ -1,0 +1,42 @@
+[package]
+name = "fuel-core-tondi-ingot-adapter"
+version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+keywords = ["blockchain", "fuel", "fuel-vm", "tondi", "sovereign-rollup"]
+license = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+description = "Tondi L1 Ingot adapter for FuelVM Sovereign Rollup - submits block batches to Tondi DA layer"
+
+[features]
+test-helpers = ["fuel-core-types/test-helpers"]
+
+[dependencies]
+# Fuel dependencies
+fuel-core-services = { workspace = true }
+fuel-core-types = { workspace = true, features = ["std", "serde"] }
+
+# Tondi dependencies (from parent AvatoLabs directory)
+tondi-consensus-core = { path = "../../../../Tondi/consensus/core" }
+tondi-hashes = { path = "../../../../Tondi/crypto/hashes" }
+
+# Common dependencies
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+blake3 = { workspace = true }
+borsh = { version = "1.2", features = ["derive"] }
+hex = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "sync", "time"] }
+tracing = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+fuel-core-services = { path = "../../services", features = ["test-helpers"] }
+fuel-core-types = { path = "../../types", features = ["test-helpers"] }
+tokio = { workspace = true, features = ["macros", "test-util", "rt-multi-thread"] }
+

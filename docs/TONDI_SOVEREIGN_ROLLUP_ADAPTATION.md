@@ -458,21 +458,15 @@ impl Default for TondiL1SubmissionConfig {
 
 ### 频率对齐策略
 
-#### 策略 1: 固定间隔批量提交（推荐）
+#### 策略 1: 固定间隔批量提交（上正轨以后才推荐）
 
-```
-FuelVM 区块: B1 ─ B2 ─ B3 ─ B4 ─ B5 ─ B6 ─ ...
-                 │                   │
-                 └─── Batch 1 ───────┘─── Batch 2 ───→ Tondi L1
-                     (12s interval)      (12s interval)
-```
 
 **配置示例**:
 ```bash
 # FuelVM 每 2 秒生产一个区块
 --poa-interval-period=2s
 
-# Tondi 提交配置：每 12 秒提交，批次包含约 6 个区块
+# Tondi 提交配置：每 12 秒提交，批次包含约 10 个区块
 --tondi-submission-interval=12s
 --tondi-max-batch-size=10
 --tondi-min-batch-size=1
@@ -1058,6 +1052,315 @@ let block_data_list: Vec<FuelBlockData> = blocks
     .collect::<Result<_, _>>()?;
 ```
 
+---
+
+## Tondi Reorg 处理与同步机制
+
+### 问题分析
+
+在 Sovereign Rollup 架构中，FuelVM 将区块批次提交到 Tondi L1 作为数据可用性层。当 Tondi 发生 reorg 时，需要考虑以下场景：
+
+```
+时间线示例:
+  T0: FuelVM 生产区块 [F1, F2, F3]
+  T1: 提交批次 B1 到 Tondi (包含 F1, F2, F3)
+  T2: Tondi 区块 T100 包含了 B1 (1 确认)
+  T3: Tondi 发生 reorg，T100 被移除
+  T4: 批次 B1 状态未知 - 可能丢失或在新链的不同位置
+```
+
+### Tondi 的 Finality 特性
+
+根据 Tondi GHOSTDAG 共识机制：
+
+| 特性 | 值 | 说明 |
+|-----|-----|------|
+| 确认时间 | 1-2 秒 | 快速软确认 |
+| 最终性确认 | 10 个确认 | DAA score 排序后达到单一活跃状态 |
+| 通知机制 | `VirtualChainChanged` | 包含 `added` 和 `removed` 区块哈希 |
+| Reorg 深度 | 通常 ≤ 3 块 | GHOSTDAG 的 k-cluster 特性限制 reorg 深度 |
+
+### 批次状态机
+
+```rust
+/// 批次在 Tondi 上的状态
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BatchL1Status {
+    /// 已提交但未确认（在 mempool 或 0 确认）
+    Pending,
+    /// 已包含在 Tondi 区块中，但未达到 finality
+    Included { 
+        tondi_block: Hash,
+        confirmations: u8,
+    },
+    /// 达到 finality（≥6 确认）
+    Finalized {
+        tondi_block: Hash,
+        daa_score: u64,
+    },
+    /// 被 reorg 移除，需要重新提交
+    Orphaned,
+    /// 重新提交中
+    Resubmitting,
+}
+```
+
+### 同步策略设计
+
+#### 1. 订阅 Tondi 通知
+
+```rust
+use tondi_consensus_notify::notification::{
+    Notification, VirtualChainChangedNotification
+};
+
+pub struct TondiSyncService {
+    /// 批次状态追踪
+    batch_tracker: BTreeMap<u64, BatchRecord>,
+    /// Tondi 通知订阅
+    notification_rx: Receiver<Notification>,
+    /// 待确认批次（batch_number -> tondi_block_hash）
+    pending_confirmations: HashMap<u64, Hash>,
+}
+
+impl TondiSyncService {
+    /// 处理 Tondi 链变化通知
+    async fn handle_virtual_chain_changed(
+        &mut self,
+        notification: VirtualChainChangedNotification,
+    ) -> anyhow::Result<()> {
+        // 1. 处理被移除的区块（reorg）
+        for removed_hash in notification.removed_chain_block_hashes.iter() {
+            self.handle_removed_block(*removed_hash).await?;
+        }
+        
+        // 2. 处理新增的区块（确认）
+        for (added_hash, acceptance_data) in notification
+            .added_chain_block_hashes
+            .iter()
+            .zip(notification.added_chain_blocks_acceptance_data.iter())
+        {
+            self.handle_added_block(*added_hash, acceptance_data).await?;
+        }
+        
+        // 3. 更新确认数
+        self.update_confirmations().await?;
+        
+        Ok(())
+    }
+    
+    /// 处理被 reorg 移除的区块
+    async fn handle_removed_block(&mut self, removed_hash: Hash) -> anyhow::Result<()> {
+        // 检查是否有批次在该区块中
+        let affected_batches: Vec<_> = self.pending_confirmations
+            .iter()
+            .filter(|(_, block_hash)| **block_hash == removed_hash)
+            .map(|(batch_num, _)| *batch_num)
+            .collect();
+        
+        for batch_num in affected_batches {
+            tracing::warn!(
+                batch = batch_num,
+                block = %removed_hash,
+                "Batch orphaned due to Tondi reorg"
+            );
+            
+            // 标记批次为 Orphaned
+            if let Some(record) = self.batch_tracker.get_mut(&batch_num) {
+                record.l1_status = BatchL1Status::Orphaned;
+            }
+            
+            // 从待确认列表移除
+            self.pending_confirmations.remove(&batch_num);
+            
+            // 触发重新提交
+            self.schedule_resubmission(batch_num).await?;
+        }
+        
+        Ok(())
+    }
+}
+```
+
+#### 2. Finality 确认策略
+
+```rust
+/// Finality 配置
+pub struct FinalityConfig {
+    /// 需要的最小确认数（默认 6）
+    pub required_confirmations: u8,
+    /// 确认检查间隔
+    pub check_interval: Duration,
+    /// 最大等待时间（超时后警告但不阻塞）
+    pub max_wait_time: Duration,
+}
+
+impl TondiSyncService {
+    /// 检查批次是否达到 finality
+    async fn check_batch_finality(&self, batch_num: u64) -> anyhow::Result<bool> {
+        let record = self.batch_tracker.get(&batch_num)
+            .ok_or_else(|| anyhow::anyhow!("Batch {} not found", batch_num))?;
+        
+        match &record.l1_status {
+            BatchL1Status::Included { confirmations, .. } => {
+                Ok(*confirmations >= self.finality_config.required_confirmations)
+            }
+            BatchL1Status::Finalized { .. } => Ok(true),
+            _ => Ok(false),
+        }
+    }
+    
+    /// 更新所有待确认批次的确认数
+    async fn update_confirmations(&mut self) -> anyhow::Result<()> {
+        let current_daa_score = self.get_current_daa_score().await?;
+        
+        for (batch_num, block_hash) in self.pending_confirmations.iter() {
+            let block_daa_score = self.get_block_daa_score(*block_hash).await?;
+            let confirmations = current_daa_score.saturating_sub(block_daa_score);
+            
+            if let Some(record) = self.batch_tracker.get_mut(batch_num) {
+                if confirmations >= self.finality_config.required_confirmations as u64 {
+                    record.l1_status = BatchL1Status::Finalized {
+                        tondi_block: *block_hash,
+                        daa_score: block_daa_score,
+                    };
+                    tracing::info!(
+                        batch = batch_num,
+                        confirmations = confirmations,
+                        "Batch reached finality"
+                    );
+                } else {
+                    record.l1_status = BatchL1Status::Included {
+                        tondi_block: *block_hash,
+                        confirmations: confirmations as u8,
+                    };
+                }
+            }
+        }
+        
+        Ok(())
+    }
+}
+```
+
+#### 3. 重新提交机制
+
+```rust
+impl TondiIngotAdapter {
+    /// 重新提交被 orphaned 的批次
+    async fn resubmit_batch(&mut self, batch_num: u64) -> anyhow::Result<()> {
+        // 1. 从本地存储获取批次数据
+        let batch_record = self.storage.get_batch_record(batch_num)?
+            .ok_or_else(|| anyhow::anyhow!("Batch {} not found in storage", batch_num))?;
+        
+        // 2. 检查是否已经在新链中（可能已被包含在其他区块）
+        if self.check_batch_in_chain(&batch_record).await? {
+            tracing::info!(batch = batch_num, "Batch already in chain, skipping resubmission");
+            return Ok(());
+        }
+        
+        // 3. 重新构建并提交 Ingot 交易
+        tracing::info!(batch = batch_num, "Resubmitting orphaned batch");
+        
+        let ingot_tx = self.build_ingot_transaction(&batch_record)?;
+        let txid = self.tondi_rpc.submit_transaction(ingot_tx).await?;
+        
+        // 4. 更新批次状态
+        self.batch_tracker.get_mut(&batch_num)
+            .map(|r| r.l1_status = BatchL1Status::Resubmitting);
+        
+        Ok(())
+    }
+    
+    /// 检查批次是否已在链中（通过 schema_id 和 batch_number）
+    async fn check_batch_in_chain(&self, batch_record: &BatchRecord) -> anyhow::Result<bool> {
+        // 查询 Tondi 的 Ingot UTXO 索引
+        let existing = self.tondi_rpc
+            .get_ingot_by_schema_and_batch(
+                &self.schema_id,
+                batch_record.batch_info.batch_number,
+            )
+            .await?;
+        
+        Ok(existing.is_some())
+    }
+}
+```
+
+### FuelVM 区块 Finality 语义
+
+在 Sovereign Rollup 模式下，FuelVM 区块的 finality 有两层含义：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ FuelVM Block Finality Levels                                │
+├─────────────────────────────────────────────────────────────┤
+│ Level 1: L2 Finality (PoA 签名)                             │
+│   - 区块由授权 sequencer 签名                                │
+│   - 立即可用于本地查询                                       │
+│   - 可能被 L1 reorg 影响                                    │
+├─────────────────────────────────────────────────────────────┤
+│ Level 2: L1 Soft Confirmation (1-5 确认)                    │
+│   - 批次已包含在 Tondi 区块中                                │
+│   - 大多数情况下不会被 reorg                                 │
+│   - 可用于大多数应用场景                                     │
+├─────────────────────────────────────────────────────────────┤
+│ Level 3: L1 Finality (≥6 确认)                              │
+│   - 批次达到 Tondi finality                                  │
+│   - 不可逆转                                                 │
+│   - 适用于高价值交易和跨链桥接                                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 与 FuelVM Relayer 的关键差异
+
+| 维度 | Ethereum Relayer | Tondi Adapter |
+|-----|------------------|---------------|
+| 数据流向 | L1 → L2 (拉取事件) | L2 → L1 (推送批次) |
+| Finality 源 | Ethereum `finalized` 标签 | Tondi DAA score + 6 确认 |
+| Reorg 处理 | 只读取 finalized 区块 | 需要主动处理 reorg 和重新提交 |
+| 状态管理 | 简单高度追踪 | 批次状态机 + 确认追踪 |
+| DA 高度含义 | 最后同步的 Eth 高度 | 最后确认的 Tondi 高度 |
+
+### 错误恢复流程
+
+```
+┌──────────────┐    提交成功     ┌──────────────┐
+│   Pending    │ ────────────→  │   Included   │
+└──────────────┘                 └──────────────┘
+       │                              │  │
+       │ 提交失败                      │  │ reorg
+       ↓                              │  ↓
+┌──────────────┐    重新提交    ┌──────────────┐
+│    Failed    │ ←────────────  │   Orphaned   │
+└──────────────┘                └──────────────┘
+       │                              │
+       │ 重试成功                      │ 重新提交
+       ↓                              ↓
+┌──────────────┐    ≥6 确认    ┌──────────────┐
+│   Included   │ ────────────→  │  Finalized   │
+└──────────────┘                └──────────────┘
+```
+
+### 配置示例
+
+```toml
+# fuel-core 配置文件
+[tondi]
+enabled = true
+rpc_url = "http://localhost:16210"
+
+# Finality 配置
+required_confirmations = 6
+finality_check_interval = "2s"
+max_finality_wait = "60s"
+
+# Reorg 处理
+resubmit_delay = "5s"
+max_resubmit_attempts = 3
+orphan_detection_enabled = true
+```
+
 ## 安全考虑
 
 ### 1. 签名验证
@@ -1173,17 +1476,17 @@ tondi = ["fuel-core-tondi-ingot-adapter"] # 新增 Tondi Adapter
 
 ### 阶段 1：基础框架（1-2 周）
 
-1. ☐ 创建 `tondi-ingot-adapter` crate 骨架
-2. ☐ 定义配置结构和 CLI 参数
-3. ☐ 实现基本的 Ingot Transaction 构建
-4. ☐ 添加 `tondi` feature flag
+1. ☑ 创建 `tondi-ingot-adapter` crate 骨架
+2. ☑ 定义配置结构和 CLI 参数
+3. ☑ 实现基本的 Ingot Transaction 构建
+4. ☑ 添加 `tondi` feature flag
 
 ### 阶段 2：核心功能（2-3 周）
 
-1. ☐ 实现批量聚合逻辑
-2. ☐ 实现后台提交服务
-3. ☐ 集成到 PoA 服务
-4. ☐ 实现本地存储（待提交缓冲、批次记录）
+1. ☑ 实现批量聚合逻辑
+2. ☑ 实现后台提交服务
+3. ☑ 集成到 PoA 服务（CLI 和配置）
+4. ☑ 实现本地存储（待提交缓冲、批次记录）
 
 ### 阶段 3：测试与优化（1-2 周）
 

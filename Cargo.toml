@@ -29,6 +29,7 @@ members = [
     "crates/services/producer",
     "crates/services/relayer",
     "crates/services/shared-sequencer",
+    "crates/services/tondi-ingot-adapter",
     "crates/services/sync",
     "crates/services/tx_status_manager",
     "crates/services/txpool_v2",
@@ -112,6 +113,7 @@ fuel-core-producer = { version = "0.47.1", path = "./crates/services/producer" }
 fuel-core-provider = { version = "0.47.1", path = "./crates/provider" }
 fuel-core-relayer = { version = "0.47.1", path = "./crates/services/relayer" }
 fuel-core-services = { version = "0.47.1", path = "./crates/services" }
+fuel-core-tondi-ingot-adapter = { version = "0.47.1", path = "./crates/services/tondi-ingot-adapter" }
 fuel-core-shared-sequencer = { version = "0.47.1", path = "crates/services/shared-sequencer" }
 fuel-core-storage = { version = "0.47.1", path = "./crates/storage", default-features = false }
 fuel-core-sync = { version = "0.47.1", path = "./crates/services/sync" }

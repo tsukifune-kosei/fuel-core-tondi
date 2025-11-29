@@ -89,6 +89,8 @@ pub struct Config {
         fuel_core_poa::pre_confirmation_signature_service::config::Config,
     #[cfg(feature = "shared-sequencer")]
     pub shared_sequencer: fuel_core_shared_sequencer::Config,
+    #[cfg(feature = "tondi")]
+    pub tondi: Option<TondiConfig>,
     pub consensus_signer: SignMode,
     pub name: String,
     pub relayer_consensus_config: fuel_core_consensus_module::RelayerConsensusConfig,
@@ -220,6 +222,8 @@ impl Config {
                 ),
             #[cfg(feature = "shared-sequencer")]
             shared_sequencer: fuel_core_shared_sequencer::Config::local_node(),
+            #[cfg(feature = "tondi")]
+            tondi: None,
             consensus_signer: SignMode::Key(fuel_core_types::secrecy::Secret::new(
                 fuel_core_chain_config::default_consensus_dev_key().into(),
             )),
@@ -374,4 +378,24 @@ pub struct DaCompressionConfig {
 pub enum DaCompressionMode {
     Disabled,
     Enabled(DaCompressionConfig),
+}
+
+/// Configuration for Tondi L1 integration (Sovereign Rollup mode).
+#[cfg(feature = "tondi")]
+#[derive(Debug, Clone)]
+pub struct TondiConfig {
+    /// Tondi RPC endpoint URL.
+    pub rpc_url: url::Url,
+    /// L1 submission interval.
+    pub submission_interval: Duration,
+    /// Maximum blocks per batch.
+    pub max_batch_size: u32,
+    /// Minimum blocks before submission.
+    pub min_batch_size: u32,
+    /// Force submission timeout.
+    pub force_submission_timeout: Duration,
+    /// Schema ID for payloads.
+    pub schema_id: Option<String>,
+    /// Enable metrics.
+    pub metrics: bool,
 }

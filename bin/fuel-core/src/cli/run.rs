@@ -110,6 +110,9 @@ mod p2p;
 #[cfg(feature = "shared-sequencer")]
 mod shared_sequencer;
 
+#[cfg(feature = "tondi")]
+mod tondi;
+
 mod consensus;
 mod gas_price;
 mod graphql;
@@ -303,6 +306,10 @@ pub struct Command {
     #[cfg(feature = "shared-sequencer")]
     pub shared_sequencer_args: shared_sequencer::Args,
 
+    #[cfg_attr(feature = "tondi", clap(flatten))]
+    #[cfg(feature = "tondi")]
+    pub tondi_args: tondi::TondiArgs,
+
     #[arg(long = "disable-metrics", value_delimiter = ',', help = fuel_core_metrics::config::help_string(), env = "DISABLE_METRICS")]
     pub metrics: Vec<Module>,
 
@@ -375,6 +382,8 @@ impl Command {
             pre_confirmation_signature_service_args,
             #[cfg(feature = "shared-sequencer")]
             shared_sequencer_args,
+            #[cfg(feature = "tondi")]
+            tondi_args,
             metrics,
             max_da_lag,
             max_wait_time,
@@ -763,6 +772,8 @@ impl Command {
             pre_confirmation_signature_service: preconfirmation_signature_service_config,
             #[cfg(feature = "shared-sequencer")]
             shared_sequencer: shared_sequencer_args.try_into()?,
+            #[cfg(feature = "tondi")]
+            tondi: tondi_args.into_config(),
             consensus_signer,
             name,
             relayer_consensus_config: verifier,
