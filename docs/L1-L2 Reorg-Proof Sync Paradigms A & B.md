@@ -66,11 +66,18 @@ flowchart TB
 
 | 组件 | 文件 | 职责 |
 |------|------|------|
+| `Config` | `config.rs` | 提交配置（批次大小、间隔等） |
 | `SyncConfig` | `config.rs` | 同步配置（轮询间隔、超时等） |
+| `TondiRpcClient` | `ports.rs` | Tondi L1 RPC 抽象接口 |
 | `TondiIndexerClient` | `ports.rs` | Indexer RPC 抽象接口 |
+| `TondiSubmissionDatabase` | `ports.rs` | 提交记录数据库接口 |
 | `IndexerSyncService` | `sync.rs` | 同步服务主逻辑 |
 | `ConfirmationLevel` | `sync.rs` | 确认状态枚举 |
 | `SyncEvent` | `sync.rs` | 同步事件通知 |
+| `TondiIngotAdapter` | `adapter.rs` | 批次提交核心逻辑 |
+| `PayloadBuilder` | `payload.rs` | TLV 格式 payload 构建与编解码 |
+| `BatchHeader` | `types.rs` | 45 字节固定格式批次头 |
+| `BatchRecord` | `types.rs` | 提交记录存储类型 |
 
 ### 完整数据流
 
@@ -169,6 +176,38 @@ flowchart TB
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
+### BatchHeader 格式 (45 字节固定)
+
+```rust
+// crates/services/tondi-ingot-adapter/src/types.rs
+pub struct BatchHeader {
+    pub version: u8,           // 1 byte  - 协议版本 (当前: 1)
+    pub start_height: u64,     // 8 bytes - 首块高度
+    pub block_count: u32,      // 4 bytes - 块数量
+    pub parent_hash: [u8; 32], // 32 bytes - L2 链式关系
+}
+
+impl BatchHeader {
+    pub const VERSION: u8 = 1;
+    pub const SERIALIZED_SIZE: usize = 45; // 1 + 8 + 4 + 32
+
+    /// 计算结束高度
+    pub fn end_height(&self) -> u64 {
+        self.start_height + self.block_count as u64 - 1
+    }
+
+    /// 验证 L2 链式关系
+    pub fn follows_parent(&self, parent_last_hash: &[u8; 32]) -> bool {
+        self.parent_hash == *parent_last_hash
+    }
+
+    /// 检查是否包含指定高度
+    pub fn contains_height(&self, height: u64) -> bool {
+        height >= self.start_height && height <= self.end_height()
+    }
+}
+```
+
 ### 关键验证点
 
 | 验证 | 位置 | 描述 |
@@ -179,55 +218,107 @@ flowchart TB
 | `block_count` | L2 | 确保 header 与实际块数匹配 |
 | `truncation` | L2 | 逐块验证，失败时截断 |
 
+### Truncation 策略 (容错处理)
+
+```rust
+// 支持部分有效批次处理
+let result = payload.validate_with_truncation(|block, idx| {
+    // 验证每个块...
+    validate_block(block)?
+});
+
+if result.has_valid_blocks() {
+    // 即使部分块无效，也可以处理有效的部分
+    let valid_blocks = payload.get_valid_blocks(&result);
+    process_blocks(valid_blocks);
+}
+
+if result.truncated {
+    tracing::warn!(
+        valid_count = result.valid_count,
+        first_invalid = result.first_invalid_height,
+        "Batch truncated due to invalid block"
+    );
+}
+```
+
 ### 实现代码
 
 ```rust
 // crates/services/tondi-ingot-adapter/src/config.rs
+
+/// 提交配置
+pub struct Config {
+    pub rpc_url: url::Url,                    // Tondi RPC 端点
+    pub submission_interval: Duration,        // 提交间隔 (默认: 12 秒)
+    pub max_batch_size: u32,                  // 最大批次大小 (默认: 10 块)
+    pub min_batch_size: u32,                  // 最小批次大小 (默认: 1 块)
+    pub force_submission_timeout: Duration,   // 强制提交超时 (默认: 30 秒)
+    pub schema_id: Option<String>,            // Schema ID (默认: "fuelvm/batch/v1")
+    pub metrics: bool,                        // 启用指标收集
+    pub sync: SyncConfig,                     // 同步配置
+}
+
 /// L1-L2 同步配置
 pub struct SyncConfig {
-    /// Indexer RPC 地址 (默认: http://localhost:18110)
-    pub indexer_url: Url,
-    /// 轮询间隔 (默认: 3秒)
-    pub poll_interval: Duration,
-    /// 孤立批次超时 (默认: 45秒)
-    pub orphan_timeout: Duration,
-    /// 最大重试次数 (默认: 3)
-    pub max_resubmit_attempts: u8,
-    /// 最终确认数 (默认: 10 DAA score)
-    pub finality_confirmations: u64,
-    /// 是否启用同步
-    pub enabled: bool,
+    pub indexer_url: url::Url,           // Indexer RPC 地址 (默认: http://localhost:18110)
+    pub poll_interval: Duration,          // 轮询间隔 (默认: 3 秒)
+    pub orphan_timeout: Duration,         // 孤立批次超时 (默认: 45 秒)
+    pub max_resubmit_attempts: u8,        // 最大重试次数 (默认: 3)
+    pub finality_confirmations: u64,      // 最终确认数 (默认: 10 DAA score)
+    pub enabled: bool,                    // 是否启用同步
 }
 
 // crates/services/tondi-ingot-adapter/src/sync.rs
+
 /// 确认级别
 pub enum ConfirmationLevel {
-    NotFound,                           // 未找到
-    Pending,                            // 在 mempool
+    NotFound,                             // 未找到
+    Pending,                              // 在 mempool
     Included { daa_score, confirmations }, // 已包含，等待确认
-    Finalized { daa_score },            // 已最终确认
-    Orphaned,                           // 已孤立
+    Finalized { daa_score },              // 已最终确认
+    Orphaned,                             // 已孤立
 }
 
 /// 同步事件
 pub enum SyncEvent {
     BatchConfirmed { batch_number, instance_id, daa_score },
     BatchFinalized { batch_number, instance_id, daa_score },
-    BatchOrphaned { batch_number, tx_id, reason },
+    BatchOrphaned { batch_number, tx_id, reason: String },
     ReorgDetected { reorg_daa_score, affected_count },
 }
 
 /// Indexer 同步服务
-pub struct IndexerSyncService<I, D> {
+pub struct IndexerSyncService<I, D>
+where
+    I: TondiIndexerClient,
+    D: TondiSubmissionDatabase,
+{
     config: SyncConfig,
-    indexer: I,                         // TondiIndexerClient 实现
-    database: Arc<D>,                   // 提交数据库
-    schema_id: [u8; 32],               // FuelVM schema ID
+    indexer: I,
+    database: Arc<D>,
+    schema_id: [u8; 32],
     last_confirmed_daa_score: Mutex<u64>,
     pending_batches: Mutex<HashMap<u64, SubmittedBatchTracker>>,
+    last_sync: Mutex<Instant>,
 }
 
-impl<I, D> IndexerSyncService<I, D> {
+impl<I, D> IndexerSyncService<I, D>
+where
+    I: TondiIndexerClient,
+    D: TondiSubmissionDatabase,
+{
+    /// 创建新的同步服务
+    pub fn new(
+        config: SyncConfig,
+        indexer: I,
+        database: Arc<D>,
+        schema_id: [u8; 32],
+    ) -> Self { ... }
+
+    /// 开始跟踪新提交的批次
+    pub async fn track_submission(&self, batch_number: u64, tx_id: [u8; 32]) { ... }
+
     /// 同步一次迭代
     pub async fn sync_once(&self) -> Result<Vec<SyncEvent>> {
         // 1. 获取 Indexer 状态
@@ -236,18 +327,25 @@ impl<I, D> IndexerSyncService<I, D> {
         // 2. 查询已确认的 FuelVM 批次
         let options = IndexerQueryOptions::for_fuel_batches(
             self.schema_id,
-            Some(self.last_confirmed_daa_score),
+            if last_daa > 0 { Some(last_daa) } else { None },
         );
         let confirmed = self.indexer.query_transactions(options).await?;
         
-        // 3. 处理确认的批次
+        // 3. 处理确认的批次 (包含 payload 验证)
         for ingot in confirmed {
-            self.process_confirmed_ingot(&ingot, stats.current_daa_score).await?;
+            let batch_events = self.process_confirmed_ingot(&ingot, current_daa_score).await?;
+            events.extend(batch_events);
         }
         
         // 4. 检查孤立批次
-        self.check_orphaned_batches().await?
+        let orphan_events = self.check_orphaned_batches(current_daa_score).await?;
+        events.extend(orphan_events);
+        
+        Ok(events)
     }
+
+    /// 获取需要重新提交的批次
+    pub async fn get_batches_for_resubmission(&self) -> Vec<u64> { ... }
 }
 ```
 
@@ -256,25 +354,43 @@ impl<I, D> IndexerSyncService<I, D> {
 ```rust
 use fuel_core_tondi_ingot_adapter::{
     Config, SyncConfig, new_service_with_sync,
+    TondiSubmissionDb,
+};
+use std::sync::Arc;
+use std::time::Duration;
+
+// 创建配置
+let rpc_url = "http://localhost:16210".parse()?;
+let mut config = Config::new(rpc_url);
+
+// 配置同步服务
+config.sync = SyncConfig {
+    indexer_url: "http://localhost:18110".parse()?,
+    poll_interval: Duration::from_secs(3),
+    orphan_timeout: Duration::from_secs(45),
+    max_resubmit_attempts: 3,
+    finality_confirmations: 10,
+    enabled: true,
 };
 
 // 创建带同步的服务
-let config = Config::new(rpc_url)
-    .with_sync(SyncConfig {
-        indexer_url: "http://localhost:18110".parse()?,
-        poll_interval: Duration::from_secs(3),
-        orphan_timeout: Duration::from_secs(45),
-        finality_confirmations: 10,
-        ..Default::default()
-    });
-
 let service = new_service_with_sync(
     config,
-    rpc_client,
-    signer,
-    Arc::new(database),
-    indexer_client,
+    rpc_client,      // impl TondiRpcClient
+    signer,          // impl Signer
+    Arc::new(TondiSubmissionDb::new()),
+    indexer_client,  // impl TondiIndexerClient
 )?;
+
+// 服务导出类型
+pub use service::{
+    new_service,           // 无同步的基础服务
+    new_service_with_sync, // 带 Indexer 同步的服务
+    Service,
+    ServiceWithSync,
+    SharedState,
+    SyncState,
+};
 ```
 
 ---
@@ -390,14 +506,21 @@ flowchart TB
 
 ```rust
 // crates/services/tondi-ingot-adapter/src/config.rs
+
+impl Config {
+    pub const DEFAULT_SUBMISSION_INTERVAL: Duration = Duration::from_secs(12);
+    pub const DEFAULT_MAX_BATCH_SIZE: u32 = 10;
+    pub const DEFAULT_MIN_BATCH_SIZE: u32 = 1;
+    pub const DEFAULT_FORCE_TIMEOUT: Duration = Duration::from_secs(30);
+    pub const DEFAULT_SCHEMA: &'static str = "fuelvm/batch/v1";
+    pub const MAX_RECOMMENDED_PAYLOAD_SIZE: usize = 84 * 1024 + 512; // ~84.5 KiB
+    pub const DEFAULT_INGOT_OUTPUT_VALUE: u64 = 100_000; // 0.001 TDI
+}
+
 impl SyncConfig {
-    /// 默认轮询间隔 (3秒)
     pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(3);
-    /// 默认孤立超时 (45秒)
     pub const DEFAULT_ORPHAN_TIMEOUT: Duration = Duration::from_secs(45);
-    /// 默认最大重试次数 (3次)
     pub const DEFAULT_MAX_RESUBMIT_ATTEMPTS: u8 = 3;
-    /// 默认最终确认数 (10 DAA score)
     pub const DEFAULT_FINALITY_CONFIRMATIONS: u64 = 10;
 }
 ```
@@ -406,11 +529,19 @@ impl SyncConfig {
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
+| **提交配置 (Config)** | | |
+| `rpc_url` | localhost:16210 | Tondi RPC 端点 |
+| `submission_interval` | 12s | 批次提交间隔 |
+| `max_batch_size` | 10 | 最大批次块数 |
+| `min_batch_size` | 1 | 最小批次块数 |
+| `force_submission_timeout` | 30s | 强制提交超时 |
+| `schema_id` | "fuelvm/batch/v1" | FuelVM Schema 标识符 |
+| **同步配置 (SyncConfig)** | | |
+| `indexer_url` | localhost:18110 | Tondi Indexer RPC 地址 |
 | `poll_interval` | 3s | 轮询 Indexer 的间隔，建议 2-6 秒 |
 | `orphan_timeout` | 45s | 认为批次孤立的超时时间，建议 30-60 秒 |
 | `max_resubmit_attempts` | 3 | 最大重试次数 |
 | `finality_confirmations` | 10 | 认为已最终确认的 DAA score 差值 |
-| `indexer_url` | localhost:18110 | Tondi Indexer RPC 地址 |
 
 ---
 
@@ -693,16 +824,51 @@ fuel-core run \
 
 ```
 crates/services/tondi-ingot-adapter/src/
-├── lib.rs          # 模块导出
+├── lib.rs          # 模块导出 (公开 API)
 ├── config.rs       # Config + SyncConfig 配置
-├── adapter.rs      # TondiIngotAdapter 批次提交
-├── sync.rs         # IndexerSyncService 确认同步 ✅
-├── service.rs      # 后台服务 (RunnableService)
-├── payload.rs      # TLV payload 编码
-├── ports.rs        # 接口 traits (TondiRpcClient, TondiIndexerClient)
-├── types.rs        # 类型定义 (BatchRecord, BatchL1Status)
-├── storage.rs      # 提交数据库
-└── error.rs        # 错误类型
+├── adapter.rs      # TondiIngotAdapter - 批次提交核心逻辑
+├── sync.rs         # IndexerSyncService - 确认同步服务 ✅
+├── service.rs      # 后台服务 (RunnableService 实现)
+├── payload.rs      # TLV payload 编码/解码 + FuelBlockBatchPayload
+├── ports.rs        # 接口 traits:
+│                   #   - TondiRpcClient (L1 RPC)
+│                   #   - TondiIndexerClient (Indexer RPC)
+│                   #   - TondiSubmissionDatabase (存储接口)
+│                   #   - BlockProvider, Signer, BlockNotifier
+├── types.rs        # 类型定义:
+│                   #   - BatchHeader (45 字节固定格式)
+│                   #   - BatchRecord, BatchInfo, BatchCommitment
+│                   #   - BatchL1Status, SubmissionStatus
+│                   #   - BatchValidationResult, BlockValidationError
+├── storage.rs      # TondiSubmissionDb - 内存提交数据库实现
+└── error.rs        # TondiAdapterError 错误类型
+```
+
+### 公开 API (lib.rs 导出)
+
+```rust
+// 核心类型
+pub use adapter::{BatchSubmittedEvent, TondiIngotAdapter};
+pub use config::{Config, SyncConfig};
+pub use error::TondiAdapterError;
+
+// Payload 构建
+pub use payload::{FuelBlockBatchPayload, FuelBlockData, PayloadBuilder};
+
+// 服务
+pub use service::{new_service, new_service_with_sync, Service, ServiceWithSync, SharedState, SyncState};
+
+// 存储
+pub use storage::TondiSubmissionDb;
+
+// 同步
+pub use sync::{ConfirmationLevel, IndexerSyncService, SyncEvent};
+
+// 类型
+pub use types::{
+    BatchCommitment, BatchHeader, BatchInfo, BatchL1Status, BatchRecord,
+    BatchValidationResult, BlockValidationError, PendingBatch, SubmissionStatus,
+};
 ```
 
 ### 未来扩展 (Phase 2/3)
@@ -748,21 +914,129 @@ flowchart TB
 | 功能 | 状态 | 说明 |
 |------|------|------|
 | 批次提交 | ✅ | `TondiIngotAdapter.submit_batch()` |
-| TLV payload | ✅ | `PayloadBuilder.encode()` |
+| TLV payload | ✅ | `PayloadBuilder.encode()` / `decode()` |
+| BatchHeader 解析 | ✅ | `PayloadBuilder.decode_header_only()` (45 字节快速解析) |
 | Indexer 轮询 | ✅ | `IndexerSyncService.sync_once()` |
 | 确认追踪 | ✅ | `ConfirmationLevel` 状态机 |
 | 孤立检测 | ✅ | `check_orphaned_batches()` |
 | 事件通知 | ✅ | `SyncEvent` 枚举 |
+| Payload 验证 | ✅ | `validate_payload()` (hash + parent_hash + block_count) |
+| Truncation 策略 | ✅ | `FuelBlockBatchPayload.validate_with_truncation()` |
 | 重提交调度 | ⚠️ | 需要 Block Producer 配合 |
-| Sighash 计算 | ✅ | `calc_schnorr_signature_hash` |
-| 手续费计算 | ✅ | `calculate_ingot_transaction_mass` |
+| Sighash 计算 | ✅ | `compute_ingot_sig_msg()` (Ingot 专用!) |
+| 手续费计算 | ✅ | `calculate_ingot_transaction_mass()` |
+| 批量状态查询 | ✅ | `TondiRpcClient.get_multiple_transaction_statuses()` |
+
+### ports.rs 接口定义
+
+```rust
+/// Tondi L1 RPC 接口
+#[async_trait]
+pub trait TondiRpcClient: Send + Sync {
+    async fn submit_transaction(&self, tx_bytes: Vec<u8>) -> Result<[u8; 32]>;
+    async fn get_block_height(&self) -> Result<u64>;
+    async fn get_transaction_status(&self, tx_id: &[u8; 32]) -> Result<Option<(u64, [u8; 32])>>;
+    async fn get_multiple_transaction_statuses(&self, tx_ids: &[[u8; 32]])
+        -> Result<HashMap<[u8; 32], (u64, [u8; 32])>>;
+    async fn get_utxos(&self, address: &[u8]) -> Result<Vec<UtxoInfo>>;
+}
+
+/// Tondi Indexer RPC 接口
+#[async_trait]
+pub trait TondiIndexerClient: Send + Sync {
+    async fn get_stats(&self) -> Result<IndexerStats>;
+    async fn query_transactions(&self, options: IndexerQueryOptions) -> Result<Vec<L1IngotRecord>>;
+    async fn get_transaction(&self, instance_id: &[u8; 32]) -> Result<Option<L1IngotRecord>>;
+    async fn get_tx_status(&self, tx_id: &[u8; 32]) -> Result<L1TxStatus>;
+}
+
+/// 提交数据库接口
+pub trait TondiSubmissionDatabase: Send + Sync {
+    fn get_last_batch_number(&self) -> Result<Option<u64>>;
+    fn get_last_instance_id(&self) -> Result<Option<[u8; 32]>>;
+    fn store_batch(&self, record: &BatchRecord) -> Result<()>;
+    fn get_batch(&self, batch_number: u64) -> Result<Option<BatchRecord>>;
+    fn get_batch_by_start_height(&self, start_height: u64) -> Result<Option<BatchRecord>>;
+    fn get_batches_by_status(&self, status: SubmissionStatus) -> Result<Vec<BatchRecord>>;
+    fn update_batch(&self, record: &BatchRecord) -> Result<()>;
+    fn get_submitted_height(&self) -> Result<Option<BlockHeight>>;
+    fn set_submitted_height(&self, height: BlockHeight) -> Result<()>;
+    fn get_last_confirmed_block_hash(&self) -> Result<Option<[u8; 32]>>;
+    fn set_last_confirmed_block_hash(&self, hash: [u8; 32]) -> Result<()>;
+}
+
+/// Indexer 查询选项
+pub struct IndexerQueryOptions {
+    pub offset: usize,
+    pub limit: usize,
+    pub schema_id: Option<[u8; 32]>,
+    pub min_daa_score: Option<u64>,
+    pub max_daa_score: Option<u64>,
+    pub include_spent: bool,
+    pub sort_desc: bool,
+}
+
+/// L1 Ingot 记录
+pub struct L1IngotRecord {
+    pub txid: [u8; 32],
+    pub block_id: [u8; 32],
+    pub daa_score: u64,
+    pub tx_index: u32,
+    pub output_index: u32,
+    pub schema_id: [u8; 32],
+    pub payload_hash: [u8; 32],
+    pub payload_data: Option<Vec<u8>>,
+    pub instance_id: [u8; 32],
+    pub is_spent: bool,
+    pub spent_txid: Option<[u8; 32]>,
+    pub spent_daa_score: Option<u64>,
+    pub created_at: u64,
+}
+
+/// L1 交易状态
+pub enum L1TxStatus {
+    NotFound,
+    InMempool,
+    Included { block_id, daa_score, instance_id },
+    Rejected { reason: String },
+}
+```
 
 **关键设计原则**：
 
 1. **接口抽象**：`TondiIndexerClient` 和 `TondiRpcClient` 隔离 L1 交互
-2. **配置驱动**：`SyncConfig` 控制同步行为，无需代码改动
+2. **配置驱动**：`Config` + `SyncConfig` 控制所有行为，无需代码改动
 3. **增量实现**：Phase 1 完成后，Phase 2/3 是增量添加
 4. **事件驱动**：`SyncEvent` 允许上层服务响应状态变化
+5. **容错处理**：Truncation 策略支持部分有效批次
+6. **快速解析**：45 字节 BatchHeader 支持快速索引扫描
+
+### 测试支持 (Mock 实现)
+
+```rust
+// crates/services/tondi-ingot-adapter/src/ports.rs
+
+#[cfg(test)]
+pub mod mock {
+    pub struct MockBlockProvider { ... }
+    pub struct MockTondiRpcClient { ... }
+    pub struct MockTondiIndexerClient { ... }
+}
+
+// 使用示例
+use fuel_core_tondi_ingot_adapter::ports::mock::*;
+
+let indexer = MockTondiIndexerClient::default();
+indexer.indexed_txs.lock().unwrap().push(L1IngotRecord { ... });
+indexer.current_daa_score.lock().unwrap() = 100;
+
+let service = IndexerSyncService::new(
+    SyncConfig::default(),
+    indexer,
+    Arc::new(TondiSubmissionDb::new()),
+    schema_id,
+);
+```
 
 ---
 
@@ -887,17 +1161,46 @@ UTXO 信息用于交易构建（计算费用和找零）：
 ```rust
 // crates/services/tondi-ingot-adapter/src/ports.rs
 pub struct UtxoInfo {
+    /// Outpoint transaction ID.
     pub tx_id: [u8; 32],
+    /// Outpoint index.
     pub index: u32,
+    /// UTXO value in SAU.
     pub value: u64,
-    pub script_public_key: Vec<u8>,  // 用于创建找零输出
+    /// Script public key of the UTXO (用于创建找零输出).
+    pub script_public_key: Vec<u8>,
+    /// Script public key version.
     pub script_version: u16,
+    /// Block DAA score when this UTXO was created.
     pub block_daa_score: u64,
+    /// Whether this is a coinbase output.
     pub is_coinbase: bool,
 }
 ```
 
 **注意**: Ingot sighash 不需要完整的 UtxoEntry 数据，因为它使用 `compute_ingot_sig_msg()` 而非标准 sighash。
+
+### 找零输出创建
+
+```rust
+// adapter.rs - 找零逻辑
+let change = funding_utxo.value.saturating_sub(ingot_value + fee);
+
+// 添加找零输出 (> 1000 SAU dust threshold)
+if change > 1000 {
+    let pubkey = self.signer.public_key();
+    // X-only pubkey: OP_DATA_32 <pubkey> OP_CHECKSIG
+    let change_spk = if pubkey.len() == 32 {
+        let mut script = vec![0x20]; // OP_DATA_32
+        script.extend_from_slice(&pubkey);
+        script.push(0xac); // OP_CHECKSIG
+        ScriptPublicKey::from_vec(0, script)
+    } else {
+        ScriptPublicKey::from_vec(0, pubkey)
+    };
+    outputs.push(TransactionOutput { value: change, script_public_key: change_spk });
+}
+```
 
 ### 签名格式
 
@@ -919,3 +1222,85 @@ let witness_script = create_ingot_signature_script(&witness)?;
 **签名类型 (在 IngotOutput.lock 中指定)**:
 - `CopperootSchnorr` (0x01): BLAKE3 sighash + BIP340 Schnorr (Tondi 原生)
 - `StandardSchnorr` (0x04): SHA256 sighash + BIP340 Schnorr (Bitcoin 兼容)
+
+---
+
+## 错误处理
+
+### TondiAdapterError 类型
+
+```rust
+// crates/services/tondi-ingot-adapter/src/error.rs
+pub enum TondiAdapterError {
+    /// Serialization error.
+    Serialization(String),
+    /// Deserialization error.
+    Deserialization(String),
+    /// Payload build error.
+    PayloadBuild(String),
+    /// Payload too large.
+    PayloadTooLarge { size: usize, max: usize },
+    /// Invalid block data.
+    InvalidBlockData(String),
+    /// Signing error.
+    Signing(String),
+    /// RPC error.
+    Rpc(String),
+    /// Submission error.
+    Submission(String),
+    /// Storage error.
+    Storage(String),
+    /// Indexer error.
+    Indexer(String),
+}
+```
+
+### 常见错误场景
+
+| 错误 | 原因 | 处理方式 |
+|------|------|----------|
+| `PayloadTooLarge` | 批次超过 ~85KB 限制 | 减少 `max_batch_size` |
+| `InvalidBlockData` | 非连续块或空批次 | 检查块排序和数据 |
+| `Submission("No UTXOs")` | 没有可用 UTXO | 确保有足够资金 |
+| `Submission("Insufficient funds")` | UTXO 余额不足 | 补充资金 |
+| `Signing` | 签名失败 | 检查密钥配置 |
+
+---
+
+## 安全考虑
+
+### Merkle 树防篡改 (CVE-2012-2459)
+
+```rust
+// payload.rs - Merkle root 包含列表长度
+fn merkle_root(hashes: &[[u8; 32]]) -> [u8; 32] {
+    // ... 计算树根 ...
+    
+    // CVE-2012-2459 修复: 包含原始长度
+    let original_len = hashes.len() as u64;
+    let mut final_data = [0u8; 40];
+    final_data[..8].copy_from_slice(&original_len.to_le_bytes());
+    final_data[8..].copy_from_slice(&tree_root);
+    *blake3::hash(&final_data).as_bytes()
+}
+```
+
+这确保 `[A, B, C]` 和 `[A, B, C, C]` 产生不同的根哈希。
+
+### L2 链式关系验证
+
+```rust
+// sync.rs - 验证 parent_hash
+fn validate_payload(&self, ingot: &L1IngotRecord, expected_parent: Option<&[u8; 32]>) {
+    // 1. 验证 payload hash
+    let computed = blake3::hash(payload_data);
+    if computed != ingot.payload_hash {
+        return Err("Payload hash mismatch");
+    }
+    
+    // 2. 验证 parent_hash (防止 L2 分叉)
+    if !payload.validate_header(expected_parent) {
+        return Err("Parent hash mismatch - possible fork!");
+    }
+}
+```
